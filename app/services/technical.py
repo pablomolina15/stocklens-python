@@ -1,6 +1,6 @@
 """
 Servicio de análisis técnico.
-yfinance 0.2.65 + pandas-ta 0.4.71b0
+Compatible con yfinance 0.2.65 + pandas-ta 0.4.71b0 + pandas 2.2.x
 """
 import logging
 import time
@@ -33,7 +33,7 @@ def _safe_float(val) -> Optional[float]:
 def _safe_int(val) -> int:
     try:
         v = int(val)
-        return 0 if v < 0 else v
+        return max(0, v)
     except (TypeError, ValueError):
         return 0
 
@@ -42,7 +42,6 @@ def fetch_and_analyze(ticker: str, period: str) -> TechnicalResponse:
     ticker = ticker.upper()
     interval = PERIOD_INTERVAL.get(period, "1d")
 
-    # ── Download with retries ─────────────────────────────────
     df = None
     for attempt in range(settings.max_retries):
         try:
@@ -52,38 +51,44 @@ def fetch_and_analyze(ticker: str, period: str) -> TechnicalResponse:
                 break
             df = None
         except Exception as e:
-            logger.warning("yfinance attempt %d failed for %s: %s", attempt + 1, ticker, e)
+            logger.warning("yfinance attempt %d/%d for %s: %s",
+                           attempt + 1, settings.max_retries, ticker, e)
             if attempt < settings.max_retries - 1:
                 time.sleep(settings.retry_delay * (attempt + 1))
 
     if df is None or df.empty:
-        raise ValueError(f"No se encontraron datos para '{ticker}'. Verifica que el ticker sea válido.")
+        raise ValueError(
+            f"No se encontraron datos para '{ticker}'. "
+            "Verifica que el ticker sea válido (ej: AAPL, MSFT, NVDA)."
+        )
 
-    # ── Clean index ───────────────────────────────────────────
+    # ── Reset index and normalise date column ─────────────────────────────
     df = df.reset_index()
     date_col = "Datetime" if "Datetime" in df.columns else "Date"
-    df["Date"] = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
+    df["_date"] = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
     df = df.dropna(subset=["Close"]).copy()
 
-    # ── Rename columns for pandas-ta compatibility ────────────
-    df.rename(columns={
-        "Open": "open", "High": "high", "Low": "low",
-        "Close": "close", "Volume": "volume"
-    }, inplace=True)
+    # Keep original column names for pandas-ta (it expects Title Case)
+    # but add lowercase aliases for our OHLCV access
+    df["_open"]   = df["Open"]
+    df["_high"]   = df["High"]
+    df["_low"]    = df["Low"]
+    df["_close"]  = df["Close"]
+    df["_volume"] = df["Volume"]
 
-    # ── Calculate indicators ──────────────────────────────────
+    # ── Calculate indicators ──────────────────────────────────────────────
     try:
-        df.ta.sma(length=50,  close="close", append=True)
-        df.ta.sma(length=200, close="close", append=True)
-        df.ta.ema(length=50,  close="close", append=True)
-        df.ta.ema(length=200, close="close", append=True)
-        df.ta.rsi(length=14,  close="close", append=True)
-        df.ta.macd(fast=12, slow=26, signal=9, close="close", append=True)
-        df.ta.bbands(length=20, std=2, close="close", append=True)
+        df.ta.sma(length=50,  close="Close", append=True)
+        df.ta.sma(length=200, close="Close", append=True)
+        df.ta.ema(length=50,  close="Close", append=True)
+        df.ta.ema(length=200, close="Close", append=True)
+        df.ta.rsi(length=14,  close="Close", append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, close="Close", append=True)
+        df.ta.bbands(length=20, std=2, close="Close", append=True)
     except Exception as e:
-        logger.warning("pandas-ta error for %s: %s — continuing without some indicators", ticker, e)
+        logger.warning("pandas-ta partial error for %s: %s", ticker, e)
 
-    # ── Map generated column names ────────────────────────────
+    # ── Map generated column names ────────────────────────────────────────
     col_map = {
         "SMA_50": "sma50", "SMA_200": "sma200",
         "EMA_50": "ema50", "EMA_200": "ema200",
@@ -97,16 +102,16 @@ def fetch_and_analyze(ticker: str, period: str) -> TechnicalResponse:
     }
     df.rename(columns={k: v for k, v in col_map.items() if k in df.columns}, inplace=True)
 
-    # ── Build point list ──────────────────────────────────────
+    # ── Build point list ──────────────────────────────────────────────────
     points: list[OHLCVPoint] = []
     for _, row in df.iterrows():
         points.append(OHLCVPoint(
-            date=str(row["Date"]),
-            open=_safe_float(row.get("open", 0)) or 0,
-            high=_safe_float(row.get("high", 0)) or 0,
-            low=_safe_float(row.get("low", 0)) or 0,
-            close=_safe_float(row.get("close", 0)) or 0,
-            volume=_safe_int(row.get("volume", 0)),
+            date=str(row["_date"]),
+            open=_safe_float(row["_open"]) or 0,
+            high=_safe_float(row["_high"]) or 0,
+            low=_safe_float(row["_low"]) or 0,
+            close=_safe_float(row["_close"]) or 0,
+            volume=_safe_int(row["_volume"]),
             sma50=_safe_float(row.get("sma50")),
             sma200=_safe_float(row.get("sma200")),
             ema50=_safe_float(row.get("ema50")),
@@ -139,29 +144,25 @@ def _detect_signals(data: list[OHLCVPoint]) -> TechnicalSignals:
     last = data[-1]
     prev = data[-2]
 
-    # SMA cross
     if all(v is not None for v in [last.sma50, last.sma200, prev.sma50, prev.sma200]):
-        if prev.sma50 < prev.sma200 and last.sma50 > last.sma200:  # type: ignore
+        if prev.sma50 < prev.sma200 and last.sma50 > last.sma200:   # type: ignore
             s.golden_cross = True; s.trend = "bullish"
-        elif prev.sma50 > prev.sma200 and last.sma50 < last.sma200:  # type: ignore
+        elif prev.sma50 > prev.sma200 and last.sma50 < last.sma200: # type: ignore
             s.death_cross = True; s.trend = "bearish"
         else:
-            s.trend = "bullish" if last.sma50 > last.sma200 else "bearish"  # type: ignore
+            s.trend = "bullish" if last.sma50 > last.sma200 else "bearish" # type: ignore
 
-    # RSI
     if last.rsi is not None:
-        s.rsi_value = round(last.rsi, 2)
+        s.rsi_value      = round(last.rsi, 2)
         s.rsi_overbought = last.rsi > 70
         s.rsi_oversold   = last.rsi < 30
 
-    # MACD cross
     if all(v is not None for v in [last.macd, last.macdSignal, prev.macd, prev.macdSignal]):
         if prev.macd < prev.macdSignal and last.macd > last.macdSignal:  # type: ignore
             s.macd_bullish = True
-        elif prev.macd > prev.macdSignal and last.macd < last.macdSignal:  # type: ignore
+        elif prev.macd > prev.macdSignal and last.macd < last.macdSignal: # type: ignore
             s.macd_bearish = True
 
-    # Bollinger
     if last.bbUpper is not None:
         s.price_above_bb_upper = last.close > last.bbUpper
     if last.bbLower is not None:
