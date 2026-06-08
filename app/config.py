@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     cors_origins: List[str] = [
         "http://localhost:3000",
         "https://localhost:3000",
-        "https://investment-platform-lilac.vercel.app/"
+        "https://investment-platform-lilac.vercel.app"
         # Añade aquí tu dominio de Vercel, ej:
         # "https://investment-platform.vercel.app",
         # "https://tu-dominio.vercel.app",
