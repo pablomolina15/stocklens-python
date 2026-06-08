@@ -1,16 +1,27 @@
+# ── Web framework ─────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
-yfinance==0.2.40
-pandas==2.2.2
-pandas-ta==0.3.14b0
-numpy==1.26.4
-httpx==0.27.0
-python-dotenv==1.0.1
-pydantic==2.7.4
-pydantic-settings==2.3.4
+gunicorn==22.0.0
+
+# ── Data / Finance ────────────────────────────────────────────
+yfinance==0.2.65          # last stable 0.2.x — v1.x has breaking API changes
+pandas==2.2.2             # pandas-ta requires <3.x
+pandas-ta==0.4.71b0       # only two versions exist: 0.4.67b0 and 0.4.71b0
+numpy==1.26.4             # pandas 2.2.x compatible
+
+# ── ML ────────────────────────────────────────────────────────
 scikit-learn==1.5.1
 joblib==1.4.2
-psycopg2-binary==2.9.9
+
+# ── Config / utils ───────────────────────────────────────────
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+httpx==0.27.0
+
+# ── Database ──────────────────────────────────────────────────
 supabase==2.5.0
-gunicorn==22.0.0
-tensorflow-cpu==2.15.0
+
+# ── TensorFlow: DISABLED by default (too heavy for Railway free 512MB RAM)
+# Uncomment ONLY if on Railway Hobby ($5/mo, 8GB RAM) or Render paid plan:
+# tensorflow-cpu==2.15.0

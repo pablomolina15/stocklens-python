@@ -1,7 +1,5 @@
 """
-Servicio de análisis fundamental.
-Extrae métricas de yfinance .info, .financials, .balance_sheet
-y calcula el Value Investing Score.
+Servicio de análisis fundamental — yfinance 0.2.65
 """
 import logging
 import time
@@ -21,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 def _v(info: dict, key: str) -> Optional[float]:
-    """Extrae float de info dict, devuelve None si no existe o es NaN."""
     val = info.get(key)
     if val is None:
         return None
@@ -35,40 +32,38 @@ def _v(info: dict, key: str) -> Optional[float]:
 def fetch_and_analyze(ticker: str) -> FundamentalResponse:
     ticker = ticker.upper()
 
-    # ── Descargar con reintentos ──────────────────────────────────────────────
+    info: dict = {}
     stock = None
-    info = {}
     for attempt in range(settings.max_retries):
         try:
             stock = yf.Ticker(ticker)
             info = stock.info or {}
-            if info.get("regularMarketPrice") or info.get("currentPrice"):
+            # yfinance 0.2.x returns regularMarketPrice for valid tickers
+            if info.get("regularMarketPrice") or info.get("currentPrice") or info.get("trailingPE"):
                 break
         except Exception as e:
-            logger.warning(f"yfinance attempt {attempt+1} for {ticker}: {e}")
+            logger.warning("yfinance attempt %d for %s: %s", attempt + 1, ticker, e)
             if attempt < settings.max_retries - 1:
-                time.sleep(settings.retry_delay)
+                time.sleep(settings.retry_delay * (attempt + 1))
 
-    # ── Revenue Growth YoY desde income statement ────────────────────────────
+    # Revenue growth YoY from income statement
     revenue_growth_yoy: Optional[float] = None
     try:
         if stock is not None:
             fin = stock.financials
             if fin is not None and not fin.empty:
-                rev_row = None
-                for label in ["Total Revenue", "Revenue"]:
+                for label in ["Total Revenue", "Revenue", "TotalRevenue"]:
                     if label in fin.index:
                         rev_row = fin.loc[label]
+                        if len(rev_row) >= 2:
+                            r_curr = float(rev_row.iloc[0])
+                            r_prev = float(rev_row.iloc[1])
+                            if r_prev and r_prev != 0:
+                                revenue_growth_yoy = round(((r_curr - r_prev) / abs(r_prev)) * 100, 2)
                         break
-                if rev_row is not None and len(rev_row) >= 2:
-                    r_curr = float(rev_row.iloc[0])
-                    r_prev = float(rev_row.iloc[1])
-                    if r_prev and r_prev != 0:
-                        revenue_growth_yoy = round(((r_curr - r_prev) / abs(r_prev)) * 100, 2)
     except Exception as e:
-        logger.warning(f"Could not compute revenue growth for {ticker}: {e}")
+        logger.warning("Revenue growth error for %s: %s", ticker, e)
 
-    # ── Construir métricas ────────────────────────────────────────────────────
     eg = _v(info, "earningsGrowth")
     metrics = FundamentalMetrics(
         eps=_v(info, "trailingEps"),
@@ -110,8 +105,7 @@ def fetch_and_analyze(ticker: str) -> FundamentalResponse:
 
 def _calculate_value_score(m: FundamentalMetrics) -> ValueScore:
     criteria: list[ValueCriterion] = []
-    total = 0
-    max_pts = 0
+    total = 0; max_pts = 0
 
     def add(name: str, desc: str, passed: bool, pts: int, detail: str):
         nonlocal total, max_pts
@@ -123,53 +117,27 @@ def _calculate_value_score(m: FundamentalMetrics) -> ValueScore:
             points_earned=earned, points_max=pts, detail=detail
         ))
 
-    # 1. PER
     if m.pe_ratio is not None:
-        add("PER Razonable", "P/E < 25", m.pe_ratio < 25, 15,
-            f"PER: {m.pe_ratio:.1f}")
-
-    # 2. P/Book
+        add("PER Razonable", "P/E < 25", m.pe_ratio < 25, 15, f"PER: {m.pe_ratio:.1f}")
     if m.pb_ratio is not None:
-        add("P/Book Bajo", "P/B < 3.0", m.pb_ratio < 3.0, 10,
-            f"P/B: {m.pb_ratio:.2f}")
-
-    # 3. Deuda
+        add("P/Book Bajo", "P/B < 3.0", m.pb_ratio < 3.0, 10, f"P/B: {m.pb_ratio:.2f}")
     if m.debt_to_equity is not None:
-        add("Deuda Controlada", "D/E < 100%", m.debt_to_equity < 100, 15,
-            f"D/E: {m.debt_to_equity:.1f}%")
-
-    # 4. Margen neto
+        add("Deuda Controlada", "D/E < 100%", m.debt_to_equity < 100, 15, f"D/E: {m.debt_to_equity:.1f}%")
     if m.profit_margin is not None:
         pct = m.profit_margin * 100 if m.profit_margin < 1 else m.profit_margin
-        add("Rentabilidad", "Margen neto > 5%", pct > 5, 15,
-            f"Margen: {pct:.1f}%")
-
-    # 5. Current ratio
+        add("Rentabilidad", "Margen neto > 5%", pct > 5, 15, f"Margen: {pct:.1f}%")
     if m.current_ratio is not None:
-        add("Liquidez", "Current Ratio > 1.5", m.current_ratio > 1.5, 10,
-            f"Ratio: {m.current_ratio:.2f}")
-
-    # 6. ROE
+        add("Liquidez", "Current Ratio > 1.5", m.current_ratio > 1.5, 10, f"Ratio: {m.current_ratio:.2f}")
     if m.roe is not None:
         pct = m.roe * 100 if m.roe < 1 else m.roe
-        add("ROE Elevado", "ROE > 15%", pct > 15, 15,
-            f"ROE: {pct:.1f}%")
-
-    # 7. Revenue growth
+        add("ROE Elevado", "ROE > 15%", pct > 15, 15, f"ROE: {pct:.1f}%")
     if m.revenue_growth_yoy is not None:
-        add("Crecimiento YoY", "Ingresos crecen > 5%", m.revenue_growth_yoy > 5, 10,
-            f"Crecimiento: {m.revenue_growth_yoy:.1f}%")
-
-    # 8. PEG
+        add("Crecimiento YoY", "Ingresos crecen > 5%", m.revenue_growth_yoy > 5, 10, f"Crecimiento: {m.revenue_growth_yoy:.1f}%")
     if m.peg_ratio is not None and m.peg_ratio > 0:
-        add("PEG Ratio", "PEG < 1.5", m.peg_ratio < 1.5, 10,
-            f"PEG: {m.peg_ratio:.2f}")
-
-    # 9. Dividendo (bonus)
+        add("PEG Ratio", "PEG < 1.5", m.peg_ratio < 1.5, 10, f"PEG: {m.peg_ratio:.2f}")
     if m.dividend_yield is not None:
         dy = m.dividend_yield * 100 if m.dividend_yield < 1 else m.dividend_yield
-        add("Dividendo", "Yield > 1%", dy > 1, 5,
-            f"Yield: {dy:.2f}%")
+        add("Dividendo", "Yield > 1%", dy > 1, 5, f"Yield: {dy:.2f}%")
 
     score = round((total / max_pts * 100)) if max_pts else 0
     passed_count = sum(1 for c in criteria if c.passed)
@@ -180,9 +148,6 @@ def _calculate_value_score(m: FundamentalMetrics) -> ValueScore:
     else:             rating, color = "DÉBIL",     "red"
 
     return ValueScore(
-        score=score,
-        rating=rating,
-        color=color,
-        criteria=criteria,
+        score=score, rating=rating, color=color, criteria=criteria,
         summary=f"{passed_count}/{len(criteria)} criterios cumplidos",
     )

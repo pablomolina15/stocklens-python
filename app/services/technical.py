@@ -1,6 +1,6 @@
 """
 Servicio de análisis técnico.
-Descarga OHLCV con yfinance y calcula todos los indicadores con pandas-ta.
+yfinance 0.2.65 + pandas-ta 0.4.71b0
 """
 import logging
 import time
@@ -18,16 +18,11 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 PERIOD_INTERVAL = {
-    "3mo": "1d",
-    "6mo": "1d",
-    "1y":  "1d",
-    "2y":  "1wk",
-    "5y":  "1wk",
+    "3mo": "1d", "6mo": "1d", "1y": "1d", "2y": "1wk", "5y": "1wk",
 }
 
 
 def _safe_float(val) -> Optional[float]:
-    """Convierte a float, devuelve None si es NaN/Inf."""
     try:
         f = float(val)
         return None if (np.isnan(f) or np.isinf(f)) else round(f, 4)
@@ -37,79 +32,81 @@ def _safe_float(val) -> Optional[float]:
 
 def _safe_int(val) -> int:
     try:
-        return int(val)
+        v = int(val)
+        return 0 if v < 0 else v
     except (TypeError, ValueError):
         return 0
 
 
 def fetch_and_analyze(ticker: str, period: str) -> TechnicalResponse:
-    """
-    Descarga datos de yfinance, calcula indicadores con pandas-ta
-    y detecta señales de trading.
-    """
     ticker = ticker.upper()
     interval = PERIOD_INTERVAL.get(period, "1d")
 
-    # ── Descargar con reintentos ──────────────────────────────────────────────
+    # ── Download with retries ─────────────────────────────────
     df = None
     for attempt in range(settings.max_retries):
         try:
             stock = yf.Ticker(ticker)
             df = stock.history(period=period, interval=interval, auto_adjust=True)
-            if df is not None and not df.empty:
+            if df is not None and not df.empty and len(df) > 10:
                 break
+            df = None
         except Exception as e:
-            logger.warning(f"yfinance attempt {attempt+1} failed for {ticker}: {e}")
+            logger.warning("yfinance attempt %d failed for %s: %s", attempt + 1, ticker, e)
             if attempt < settings.max_retries - 1:
-                time.sleep(settings.retry_delay)
+                time.sleep(settings.retry_delay * (attempt + 1))
 
     if df is None or df.empty:
-        raise ValueError(f"No data available for ticker '{ticker}'")
+        raise ValueError(f"No se encontraron datos para '{ticker}'. Verifica que el ticker sea válido.")
 
-    # ── Limpiar índice ────────────────────────────────────────────────────────
+    # ── Clean index ───────────────────────────────────────────
     df = df.reset_index()
-    if "Datetime" in df.columns:
-        df.rename(columns={"Datetime": "Date"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
-    df = df.dropna(subset=["Close"])
+    date_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df["Date"] = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["Close"]).copy()
 
-    # ── Calcular indicadores con pandas-ta ────────────────────────────────────
-    closes = df["Close"]
+    # ── Rename columns for pandas-ta compatibility ────────────
+    df.rename(columns={
+        "Open": "open", "High": "high", "Low": "low",
+        "Close": "close", "Volume": "volume"
+    }, inplace=True)
 
-    df.ta.sma(length=50,  close=closes, append=True)
-    df.ta.sma(length=200, close=closes, append=True)
-    df.ta.ema(length=50,  close=closes, append=True)
-    df.ta.ema(length=200, close=closes, append=True)
-    df.ta.rsi(length=14,  close=closes, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, close=closes, append=True)
-    df.ta.bbands(length=20, std=2, close=closes, append=True)
+    # ── Calculate indicators ──────────────────────────────────
+    try:
+        df.ta.sma(length=50,  close="close", append=True)
+        df.ta.sma(length=200, close="close", append=True)
+        df.ta.ema(length=50,  close="close", append=True)
+        df.ta.ema(length=200, close="close", append=True)
+        df.ta.rsi(length=14,  close="close", append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, close="close", append=True)
+        df.ta.bbands(length=20, std=2, close="close", append=True)
+    except Exception as e:
+        logger.warning("pandas-ta error for %s: %s — continuing without some indicators", ticker, e)
 
-    # ── Mapear columnas generadas por pandas-ta ───────────────────────────────
+    # ── Map generated column names ────────────────────────────
     col_map = {
-        "SMA_50":      "sma50",
-        "SMA_200":     "sma200",
-        "EMA_50":      "ema50",
-        "EMA_200":     "ema200",
-        "RSI_14":      "rsi",
-        "MACD_12_26_9":   "macd",
-        "MACDs_12_26_9":  "macdSignal",
-        "MACDh_12_26_9":  "macdHistogram",
-        "BBU_20_2.0":  "bbUpper",
-        "BBM_20_2.0":  "bbMiddle",
-        "BBL_20_2.0":  "bbLower",
+        "SMA_50": "sma50", "SMA_200": "sma200",
+        "EMA_50": "ema50", "EMA_200": "ema200",
+        "RSI_14": "rsi",
+        "MACD_12_26_9": "macd",
+        "MACDs_12_26_9": "macdSignal",
+        "MACDh_12_26_9": "macdHistogram",
+        "BBU_20_2.0": "bbUpper",
+        "BBM_20_2.0": "bbMiddle",
+        "BBL_20_2.0": "bbLower",
     }
     df.rename(columns={k: v for k, v in col_map.items() if k in df.columns}, inplace=True)
 
-    # ── Construir lista de puntos ─────────────────────────────────────────────
+    # ── Build point list ──────────────────────────────────────
     points: list[OHLCVPoint] = []
     for _, row in df.iterrows():
         points.append(OHLCVPoint(
             date=str(row["Date"]),
-            open=_safe_float(row.get("Open", 0)) or 0,
-            high=_safe_float(row.get("High", 0)) or 0,
-            low=_safe_float(row.get("Low", 0)) or 0,
-            close=_safe_float(row.get("Close", 0)) or 0,
-            volume=_safe_int(row.get("Volume", 0)),
+            open=_safe_float(row.get("open", 0)) or 0,
+            high=_safe_float(row.get("high", 0)) or 0,
+            low=_safe_float(row.get("low", 0)) or 0,
+            close=_safe_float(row.get("close", 0)) or 0,
+            volume=_safe_int(row.get("volume", 0)),
             sma50=_safe_float(row.get("sma50")),
             sma200=_safe_float(row.get("sma200")),
             ema50=_safe_float(row.get("ema50")),
@@ -136,39 +133,35 @@ def fetch_and_analyze(ticker: str, period: str) -> TechnicalResponse:
 
 
 def _detect_signals(data: list[OHLCVPoint]) -> TechnicalSignals:
-    """Detecta cruces, divergencias y condiciones de sobrecompra/venta."""
     s = TechnicalSignals()
     if len(data) < 2:
         return s
-
     last = data[-1]
     prev = data[-2]
 
-    # ── SMA Cross ────────────────────────────────────────────────────────────
+    # SMA cross
     if all(v is not None for v in [last.sma50, last.sma200, prev.sma50, prev.sma200]):
-        if prev.sma50 < prev.sma200 and last.sma50 > last.sma200:   # type: ignore[operator]
-            s.golden_cross = True
-            s.trend = "bullish"
-        elif prev.sma50 > prev.sma200 and last.sma50 < last.sma200:  # type: ignore[operator]
-            s.death_cross = True
-            s.trend = "bearish"
+        if prev.sma50 < prev.sma200 and last.sma50 > last.sma200:  # type: ignore
+            s.golden_cross = True; s.trend = "bullish"
+        elif prev.sma50 > prev.sma200 and last.sma50 < last.sma200:  # type: ignore
+            s.death_cross = True; s.trend = "bearish"
         else:
-            s.trend = "bullish" if last.sma50 > last.sma200 else "bearish"  # type: ignore[operator]
+            s.trend = "bullish" if last.sma50 > last.sma200 else "bearish"  # type: ignore
 
-    # ── RSI ──────────────────────────────────────────────────────────────────
+    # RSI
     if last.rsi is not None:
         s.rsi_value = round(last.rsi, 2)
         s.rsi_overbought = last.rsi > 70
         s.rsi_oversold   = last.rsi < 30
 
-    # ── MACD cross ───────────────────────────────────────────────────────────
+    # MACD cross
     if all(v is not None for v in [last.macd, last.macdSignal, prev.macd, prev.macdSignal]):
-        if prev.macd < prev.macdSignal and last.macd > last.macdSignal:   # type: ignore[operator]
+        if prev.macd < prev.macdSignal and last.macd > last.macdSignal:  # type: ignore
             s.macd_bullish = True
-        elif prev.macd > prev.macdSignal and last.macd < last.macdSignal: # type: ignore[operator]
+        elif prev.macd > prev.macdSignal and last.macd < last.macdSignal:  # type: ignore
             s.macd_bearish = True
 
-    # ── Bollinger ─────────────────────────────────────────────────────────────
+    # Bollinger
     if last.bbUpper is not None:
         s.price_above_bb_upper = last.close > last.bbUpper
     if last.bbLower is not None:
