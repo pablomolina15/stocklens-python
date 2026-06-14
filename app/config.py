@@ -1,43 +1,41 @@
 import json
-from pydantic_settings import BaseSettings
-from pydantic import field_validator
+import os
 from typing import List
 
 
-class Settings(BaseSettings):
-    cors_origins: List[str] = [
+def _parse_cors(raw: str | None) -> List[str]:
+    """Parse CORS_ORIGINS from env var — handles empty, JSON array, or comma-separated."""
+    default = [
         "http://localhost:3000",
-        "https://localhost:3000",
         "https://investment-platform-lilac.vercel.app",
     ]
+    if not raw or not raw.strip():
+        return default
+    raw = raw.strip()
+    # JSON array: ["url1","url2"]
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+            result = [o.rstrip("/") for o in parsed if o and o.strip()]
+            return result if result else default
+        except json.JSONDecodeError:
+            pass
+    # Comma-separated: url1,url2
+    result = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    return result if result else default
 
-    supabase_url: str = ""
-    supabase_key: str = ""
 
-    cache_ttl_prices: int = 3600
-    cache_ttl_fundamentals: int = 86400
-    max_retries: int = 3
-    retry_delay: float = 1.0
+class Settings:
+    """Simple settings class — avoids pydantic-settings JSON pre-parsing bug with List fields."""
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v):
-        if isinstance(v, str):
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    # Strip trailing slashes from each origin
-                    return [o.rstrip("/") for o in parsed]
-            except (json.JSONDecodeError, TypeError):
-                pass
-            return [o.strip().rstrip("/") for o in v.split(",") if o.strip()]
-        if isinstance(v, list):
-            return [o.rstrip("/") for o in v]
-        return v
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    def __init__(self):
+        self.cors_origins: List[str] = _parse_cors(os.environ.get("CORS_ORIGINS", ""))
+        self.supabase_url: str = os.environ.get("SUPABASE_URL", "")
+        self.supabase_key: str = os.environ.get("SUPABASE_KEY", "")
+        self.cache_ttl_prices: int = int(os.environ.get("CACHE_TTL_PRICES", "3600"))
+        self.cache_ttl_fundamentals: int = int(os.environ.get("CACHE_TTL_FUNDAMENTALS", "86400"))
+        self.max_retries: int = int(os.environ.get("MAX_RETRIES", "3"))
+        self.retry_delay: float = float(os.environ.get("RETRY_DELAY", "1.0"))
 
 
 settings = Settings()
