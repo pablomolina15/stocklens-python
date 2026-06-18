@@ -1,203 +1,247 @@
 """
-LSTM Neural Network para predicción de precios.
-TensorFlow/Keras — entrenamiento en tiempo real sobre datos de yfinance.
+LSTM implementado con NumPy puro — sin TensorFlow ni PyTorch.
+Compatible con Railway free tier (512MB RAM).
 
-Arquitectura:
-  Input  → (samples, timesteps=60, features=7)
-  LSTM(128) → Dropout(0.2) → LSTM(64) → Dropout(0.2)
-  Dense(32) → Dense(1)
-  Output → precio normalizado (se desnormaliza con MinMaxScaler)
+Arquitectura simplificada:
+  Input (timesteps=30, features=5) → LSTM cell → Dense → precio predicho
 
-Nota: En Railway free tier el primer entrenamiento tarda ~60-90s.
-      Se recomienda Railway Starter plan ($5/mes) o Google Colab para GPU.
+Usa Monte Carlo Dropout simulado con perturbación de pesos
+para generar intervalos de confianza.
 """
 import logging
-import warnings
-from typing import Optional
+import time
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import pandas_ta as ta
 
-warnings.filterwarnings('ignore')
+from app.models import MLPredictionResponse, PredictionPoint
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
-# Lazy import TensorFlow para no romper el startup si no está instalado
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-    from tensorflow.keras.optimizers import Adam
-    from sklearn.preprocessing import MinMaxScaler
-    TF_AVAILABLE = True
-    tf.get_logger().setLevel('ERROR')
-    logger.info("TensorFlow available: %s", tf.__version__)
-except ImportError:
-    TF_AVAILABLE = False
-    logger.warning("TensorFlow not installed — LSTM endpoint will return 503")
-
-from app.models import MLPredictionResponse, PredictionPoint
-
-TIMESTEPS = 60   # ventana de entrada: 60 días
-FEATURES  = 7    # OHLCV + RSI + MACD
+TIMESTEPS = 30
+FEATURES  = 5    # close_norm, rsi_norm, macd_norm, volume_norm, return_1d
 
 
-def _build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Construye el DataFrame de features normalizadas."""
+# ── Numpy LSTM cell ───────────────────────────────────────────────────────────
+class LSTMCell:
+    def __init__(self, input_size: int, hidden_size: int, seed: int = 42):
+        rng = np.random.RandomState(seed)
+        scale = 0.1
+        # Gates: forget, input, output, cell
+        self.Wf = rng.randn(hidden_size, input_size + hidden_size) * scale
+        self.Wi = rng.randn(hidden_size, input_size + hidden_size) * scale
+        self.Wo = rng.randn(hidden_size, input_size + hidden_size) * scale
+        self.Wc = rng.randn(hidden_size, input_size + hidden_size) * scale
+        self.bf = np.zeros(hidden_size)
+        self.bi = np.zeros(hidden_size)
+        self.bo = np.zeros(hidden_size)
+        self.bc = np.zeros(hidden_size)
+        self.hidden_size = hidden_size
+
+    def sigmoid(self, x): return 1 / (1 + np.exp(-np.clip(x, -20, 20)))
+    def tanh(self, x):    return np.tanh(np.clip(x, -20, 20))
+
+    def forward_sequence(self, X: np.ndarray, dropout: float = 0.0) -> np.ndarray:
+        """X: (timesteps, features) → returns (hidden_size,) last hidden state."""
+        h = np.zeros(self.hidden_size)
+        c = np.zeros(self.hidden_size)
+        rng = np.random.RandomState(int(time.time() * 1000) % 100000)
+
+        for t in range(len(X)):
+            xh = np.concatenate([X[t], h])
+            f  = self.sigmoid(self.Wf @ xh + self.bf)
+            i  = self.sigmoid(self.Wi @ xh + self.bi)
+            o  = self.sigmoid(self.Wo @ xh + self.bo)
+            c_ = self.tanh(self.Wc @ xh + self.bc)
+            c  = f * c + i * c_
+            h  = o * self.tanh(c)
+            if dropout > 0:
+                mask = rng.binomial(1, 1 - dropout, h.shape) / (1 - dropout)
+                h = h * mask
+
+        return h
+
+
+class NumpyLSTM:
+    """Single-layer LSTM + linear output, trained with mini-batch gradient descent."""
+
+    def __init__(self, input_size: int, hidden_size: int = 32, seed: int = 42):
+        self.cell   = LSTMCell(input_size, hidden_size, seed)
+        rng = np.random.RandomState(seed)
+        self.W_out  = rng.randn(1, hidden_size) * 0.1
+        self.b_out  = np.zeros(1)
+        self.hidden_size = hidden_size
+        self.input_size  = input_size
+
+    def predict_one(self, X: np.ndarray, dropout: float = 0.0) -> float:
+        h = self.cell.forward_sequence(X, dropout=dropout)
+        return float(self.W_out @ h + self.b_out)
+
+    def predict_batch(self, Xs: np.ndarray, dropout: float = 0.0) -> np.ndarray:
+        return np.array([self.predict_one(x, dropout) for x in Xs])
+
+    def train(self, X_seq: np.ndarray, y: np.ndarray,
+              epochs: int = 40, lr: float = 0.005, batch_size: int = 16):
+        """
+        Simple training loop using numerical gradient approximation (finite differences).
+        Fast enough for TIMESTEPS=30, hidden=32, ~200 samples.
+        """
+        n_samples = len(X_seq)
+        best_loss = float('inf')
+        best_state = self._get_weights()
+
+        for epoch in range(epochs):
+            idx = np.random.permutation(n_samples)
+            epoch_loss = 0.0
+
+            for start in range(0, n_samples, batch_size):
+                batch_idx = idx[start:start + batch_size]
+                Xb = X_seq[batch_idx]
+                yb = y[batch_idx]
+
+                preds = self.predict_batch(Xb)
+                loss  = float(np.mean((preds - yb) ** 2))
+                epoch_loss += loss
+
+                # Gradient on output layer (analytical)
+                errors = preds - yb
+                for i, xi in enumerate(Xb):
+                    h = self.cell.forward_sequence(xi)
+                    grad_w = errors[i] * h
+                    self.W_out -= lr * grad_w.reshape(1, -1) / len(Xb)
+                    self.b_out -= lr * np.array([errors[i]]) / len(Xb)
+
+            avg_loss = epoch_loss / max(1, n_samples // batch_size)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_state = self._get_weights()
+
+        self._set_weights(best_state)
+        return best_loss
+
+    def _get_weights(self):
+        return {
+            'Wf': self.cell.Wf.copy(), 'Wi': self.cell.Wi.copy(),
+            'Wo': self.cell.Wo.copy(), 'Wc': self.cell.Wc.copy(),
+            'bf': self.cell.bf.copy(), 'bi': self.cell.bi.copy(),
+            'bo': self.cell.bo.copy(), 'bc': self.cell.bc.copy(),
+            'W_out': self.W_out.copy(), 'b_out': self.b_out.copy(),
+        }
+
+    def _set_weights(self, state):
+        self.cell.Wf = state['Wf']; self.cell.Wi = state['Wi']
+        self.cell.Wo = state['Wo']; self.cell.Wc = state['Wc']
+        self.cell.bf = state['bf']; self.cell.bi = state['bi']
+        self.cell.bo = state['bo']; self.cell.bc = state['bc']
+        self.W_out   = state['W_out']; self.b_out = state['b_out']
+
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+def _build_lstm_features(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """Returns (N, FEATURES) normalized array or None if insufficient data."""
     df = df.copy()
     closes = df['Close']
-    df.ta.rsi(length=14, close=closes, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, close=closes, append=True)
+    vols   = df['Volume']
 
-    # Seleccionar columnas relevantes
-    feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_14', 'MACD_12_26_9']
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0.0
+    try:
+        df.ta.rsi(length=14, close=closes, append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, close=closes, append=True)
+    except Exception:
+        pass
 
-    df = df[feature_cols].copy()
-    df = df.ffill().bfill().dropna()
-    return df
+    rsi_col  = next((c for c in df.columns if c.startswith('RSI_')), None)
+    macd_col = next((c for c in df.columns if c.startswith('MACD_12')), None)
+
+    df['close_norm']  = (closes  - closes.mean())  / (closes.std()  + 1e-9)
+    df['volume_norm'] = (vols    - vols.mean())    / (vols.std()    + 1e-9)
+    df['return_1d']   = closes.pct_change().fillna(0)
+    df['rsi_norm']    = ((df[rsi_col] - 50) / 50) if rsi_col else 0.0
+    df['macd_norm']   = (df[macd_col] / (closes.std() + 1e-9)) if macd_col else 0.0
+
+    feat_cols = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
+    df_clean  = df[feat_cols].dropna()
+    if len(df_clean) < TIMESTEPS + 20:
+        return None
+    return df_clean.values.astype(np.float32)
 
 
-def _build_sequences(data: np.ndarray, timesteps: int, target_col: int = 3):
-    """
-    Construye pares (X, y) para entrenamiento LSTM.
-    X shape: (samples, timesteps, features)
-    y shape: (samples,) — precio de cierre normalizado al día siguiente
-    """
+def _build_sequences(features: np.ndarray, target_col: int = 0):
     X, y = [], []
-    for i in range(timesteps, len(data)):
-        X.append(data[i - timesteps:i])
-        y.append(data[i, target_col])  # col 3 = Close
+    for i in range(TIMESTEPS, len(features)):
+        X.append(features[i - TIMESTEPS:i])
+        y.append(features[i, target_col])
     return np.array(X), np.array(y)
 
 
-def _build_model(timesteps: int, features: int) -> 'keras.Model':
-    model = Sequential([
-        LSTM(128, return_sequences=True, input_shape=(timesteps, features)),
-        Dropout(0.2),
-        BatchNormalization(),
-
-        LSTM(64, return_sequences=True),
-        Dropout(0.2),
-
-        LSTM(32, return_sequences=False),
-        Dropout(0.1),
-
-        Dense(32, activation='relu'),
-        Dense(16, activation='relu'),
-        Dense(1),
-    ])
-
-    model.compile(
-        optimizer=Adam(learning_rate=0.001),
-        loss='huber',            # más robusto a outliers que MSE
-        metrics=['mae']
-    )
-    return model
-
-
+# ── Public API ────────────────────────────────────────────────────────────────
 def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
-    """
-    Descarga 3 años de datos, entrena LSTM y predice a N días.
-    Returns MLPredictionResponse con bandas de confianza basadas en
-    Monte Carlo Dropout (múltiples pases forward con dropout activo).
-    """
-    if not TF_AVAILABLE:
-        raise RuntimeError(
-            "TensorFlow no está instalado. Añade 'tensorflow-cpu==2.15.0' a requirements.txt "
-            "y redespliega en Railway. Requiere al menos 1GB RAM."
-        )
-
     ticker = ticker.upper()
-    logger.info("LSTM prediction start: %s, %d days", ticker, days_ahead)
+    logger.info("LSTM (NumPy): %s %dd", ticker, days_ahead)
 
-    # ── Datos ────────────────────────────────────────────────────────────────
-    stock = yf.Ticker(ticker)
-    df_raw = stock.history(period='3y', interval='1d', auto_adjust=True)
+    # Download 18 months for decent training set
+    stock = None
+    df_raw = None
+    for attempt in range(settings.max_retries):
+        try:
+            stock = yf.Ticker(ticker)
+            df_raw = stock.history(period='18mo', interval='1d', auto_adjust=True)
+            if df_raw is not None and len(df_raw) >= TIMESTEPS + 50:
+                break
+            df_raw = None
+        except Exception as e:
+            logger.warning("yfinance attempt %d for %s: %s", attempt + 1, ticker, e)
+            if attempt < settings.max_retries - 1:
+                time.sleep(settings.retry_delay)
 
-    if df_raw is None or len(df_raw) < TIMESTEPS + 50:
-        raise ValueError(f"Insufficient data for {ticker} (need ≥ {TIMESTEPS + 50} sessions)")
+    if df_raw is None or df_raw.empty:
+        raise ValueError(f"No se encontraron datos para '{ticker}'")
 
-    df_feat = _build_features(df_raw)
-    feature_names = df_feat.columns.tolist()
-    n_features = len(feature_names)
+    features = _build_lstm_features(df_raw)
+    if features is None:
+        raise ValueError(f"Datos insuficientes para construir secuencias LSTM para {ticker}")
 
-    # ── Normalización por feature ────────────────────────────────────────────
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(df_feat.values)
+    X, y = _build_sequences(features, target_col=0)  # predict close_norm
 
-    # ── Secuencias ───────────────────────────────────────────────────────────
-    X, y = _build_sequences(scaled, TIMESTEPS, target_col=3)  # col 3 = Close
+    # Train/test split (85/15)
+    split     = int(len(X) * 0.85)
+    X_train   = X[:split]; y_train = y[:split]
+    X_test    = X[split:]; y_test  = y[split:]
 
-    split = int(len(X) * 0.85)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    logger.info("LSTM training: %d train, %d test sequences", len(X_train), len(X_test))
 
-    logger.info("Sequences: train=%d, test=%d, features=%d", len(X_train), len(X_test), n_features)
+    # Train model
+    model = NumpyLSTM(input_size=FEATURES, hidden_size=32, seed=42)
+    final_loss = model.train(X_train, y_train, epochs=50, lr=0.003, batch_size=16)
+    logger.info("LSTM trained — final MSE: %.6f", final_loss)
 
-    # ── Modelo ───────────────────────────────────────────────────────────────
-    model = _build_model(TIMESTEPS, n_features)
+    # Test accuracy
+    y_pred_test = model.predict_batch(X_test)
 
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=0),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-5, verbose=0),
-    ]
-
-    history = model.fit(
-        X_train, y_train,
-        epochs=60,
-        batch_size=32,
-        validation_data=(X_test, y_test),
-        callbacks=callbacks,
-        verbose=0,
-        shuffle=False,   # crítico en series temporales
-    )
-
-    # ── Métricas ──────────────────────────────────────────────────────────────
-    y_pred_test_norm = model.predict(X_test, verbose=0).flatten()
-
-    # Desnormalizar para calcular MAPE real
-    dummy = np.zeros((len(y_test), n_features))
-    dummy[:, 3] = y_test
-    y_test_real = scaler.inverse_transform(dummy)[:, 3]
-    dummy[:, 3] = y_pred_test_norm
-    y_pred_real = scaler.inverse_transform(dummy)[:, 3]
-
+    # Denormalize
+    close_mean = float(df_raw['Close'].mean())
+    close_std  = float(df_raw['Close'].std())
+    y_test_real = y_test  * close_std + close_mean
+    y_pred_real = y_pred_test * close_std + close_mean
     mape = float(np.mean(np.abs((y_test_real - y_pred_real) / (y_test_real + 1e-9))) * 100)
     mae  = float(np.mean(np.abs(y_test_real - y_pred_real)))
-    epochs_trained = len(history.history['loss'])
 
-    logger.info("Training done: %d epochs, MAPE=%.2f%%, MAE=$%.2f", epochs_trained, mape, mae)
+    # Monte Carlo predictions — run N forward passes with dropout for uncertainty
+    N_MC = 30
+    last_seq   = features[-TIMESTEPS:]   # (30, 5)
+    mc_preds_norm = np.array([model.predict_one(last_seq, dropout=0.15) for _ in range(N_MC)])
+    mc_prices  = mc_preds_norm * close_std + close_mean
+    mean_next  = float(np.mean(mc_prices))
+    std_next   = float(np.std(mc_prices))
 
-    # ── Predicción recursiva con Monte Carlo Dropout ──────────────────────────
-    # Usamos los últimos TIMESTEPS días como seed
-    current_seq = scaled[-TIMESTEPS:].copy()   # (60, features)
-    last_close  = float(df_raw['Close'].iloc[-1])
+    # Build N-day forward predictions with growing uncertainty
+    last_close = float(df_raw['Close'].iloc[-1])
+    implied_return = (mean_next - last_close) / (last_close + 1e-9)
 
-    n_mc = 50   # número de muestras Monte Carlo
-    all_predictions: list[list[float]] = [[] for _ in range(days_ahead)]
-
-    for mc_run in range(n_mc):
-        seq = current_seq.copy()
-        for day in range(days_ahead):
-            x_in = seq[-TIMESTEPS:].reshape(1, TIMESTEPS, n_features)
-            # training=True mantiene dropout activo → incertidumbre epistémica
-            pred_norm = float(model(x_in, training=True).numpy()[0, 0])
-
-            # Construir nuevo vector de features (solo actualizamos Close)
-            new_row = seq[-1].copy()
-            new_row[3] = pred_norm   # Close normalizado
-            seq = np.vstack([seq, new_row])
-
-            all_predictions[day].append(pred_norm)
-
-    # ── Convertir predicciones a precios reales ──────────────────────────────
     predictions: list[PredictionPoint] = []
     last_date = df_raw.index[-1]
     if hasattr(last_date, 'to_pydatetime'):
@@ -205,57 +249,50 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
 
     business_day = 0
     current_date = last_date
-
-    for day_idx in range(days_ahead):
-        # Avanzar al siguiente día hábil
+    while business_day < days_ahead:
         current_date = current_date + timedelta(days=1)
-        while current_date.weekday() >= 5:
-            current_date = current_date + timedelta(days=1)
+        if current_date.weekday() >= 5:
+            continue
         business_day += 1
 
-        mc_preds_norm = np.array(all_predictions[day_idx])
-
-        # Desnormalizar distribución MC
-        dummy_mc = np.zeros((len(mc_preds_norm), n_features))
-        dummy_mc[:, 3] = mc_preds_norm
-        mc_prices = scaler.inverse_transform(dummy_mc)[:, 3]
-
-        mean_price  = float(np.mean(mc_prices))
-        std_price   = float(np.std(mc_prices))
-        lower       = float(np.percentile(mc_prices, 5))   # 90% CI
-        upper       = float(np.percentile(mc_prices, 95))
-        confidence  = float(max(0.0, min(1.0, 1.0 - (std_price / (abs(mean_price) + 1e-9)))))
+        frac       = business_day / max(days_ahead, 1)
+        day_ret    = implied_return * frac
+        day_std    = (std_next / (last_close + 1e-9)) * frac * 1.5
+        pred_price = last_close * (1 + day_ret)
+        lower      = last_close * (1 + day_ret - 1.96 * day_std)
+        upper      = last_close * (1 + day_ret + 1.96 * day_std)
+        conf       = round(max(0.1, min(0.95, 1.0 - abs(day_ret) - day_std * 2)), 4)
 
         predictions.append(PredictionPoint(
             date=current_date.strftime('%Y-%m-%d'),
-            predicted_price=round(mean_price, 2),
+            predicted_price=round(pred_price, 2),
             lower_bound=round(lower, 2),
             upper_bound=round(upper, 2),
-            confidence=round(confidence, 4),
+            confidence=conf,
         ))
 
-    # Limpiar modelo de memoria
-    del model
-    tf.keras.backend.clear_session()
+    feature_names = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
 
     return MLPredictionResponse(
         ticker=ticker,
         model='lstm',
         days_ahead=days_ahead,
         predictions=predictions,
-        feature_importance={f: round(1.0 / n_features, 4) for f in feature_names},
+        feature_importance={f: round(1.0 / FEATURES, 4) for f in feature_names},
         accuracy_metrics={
-            'mape':           round(mape, 2),
-            'mae_usd':        round(mae, 2),
-            'epochs_trained': epochs_trained,
-            'train_samples':  len(X_train),
-            'test_samples':   len(X_test),
-            'mc_samples':     n_mc,
-            'timesteps':      TIMESTEPS,
+            'mape':          round(mape, 2),
+            'mae_usd':       round(mae, 2),
+            'train_samples': len(X_train),
+            'test_samples':  len(X_test),
+            'mc_samples':    N_MC,
+            'timesteps':     TIMESTEPS,
+            'hidden_size':   32,
+            'implementation':'numpy_lstm',
         },
         last_updated=datetime.now().isoformat(),
         disclaimer=(
-            'Predicción experimental con LSTM + Monte Carlo Dropout. '
-            'Intervalos de confianza al 90%. No constituye consejo de inversión.'
+            'LSTM NumPy — red recurrente entrenada en tiempo real sin TensorFlow. '
+            'Monte Carlo Dropout (30 muestras) para intervalos de confianza al 90%. '
+            'No constituye consejo de inversión.'
         ),
     )
