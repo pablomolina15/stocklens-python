@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 
 # Training window — 6 months is enough to capture current regime
 # without overfitting to historical crashes from 2+ years ago
-TRAIN_PERIOD   = "6mo"
-MIN_ROWS       = 80       # minimum rows after feature engineering
-NORM_WINDOW    = 60       # days for volatility normalization of target
+# TRAIN_PERIOD   = "6mo" #ya no hace falta esta linea
+MIN_ROWS       = 50       # minimum rows after feature engineering
+NORM_WINDOW    = 30       # days for volatility normalization of target
 
 # Safety clamp — last line of defense against absurd predictions
 MAX_DAILY_RET  = 0.02   # 2% max per day implied     # 3% max per day implied
@@ -67,22 +67,23 @@ def _find_col(df: pd.DataFrame, *prefixes: str) -> Optional[str]:
 
 
 def _download(ticker: str) -> pd.DataFrame:
-    for attempt in range(settings.max_retries):
-        try:
-            df = yf.Ticker(ticker).history(
-                period=TRAIN_PERIOD, interval="1d", auto_adjust=True
-            )
-            if df is not None and len(df) >= MIN_ROWS:
-                return df
-        except Exception as e:
-            logger.warning("Download attempt %d for %s: %s", attempt + 1, ticker, e)
-            if attempt < settings.max_retries - 1:
-                time.sleep(settings.retry_delay)
+    for period in ["1y", "2y", "3y"]:
+        for attempt in range(settings.max_retries):
+            try:
+                df = yf.Ticker(ticker).history(
+                    period=period, interval="1d", auto_adjust=True
+                )
+                if df is not None and len(df) >= MIN_ROWS:
+                    logger.info("Downloaded %s: %d rows (%s)", ticker, len(df), period)
+                    return df
+            except Exception as e:
+                logger.warning("Download attempt %d/%s for %s: %s", attempt + 1, period, ticker, e)
+                if attempt < settings.max_retries - 1:
+                    time.sleep(settings.retry_delay)
     raise ValueError(
-        f"No se pudieron descargar datos para '{ticker}'. "
-        "Verifica que el ticker sea válido y tenga historial suficiente."
+        f"No se pudieron descargar datos suficientes para '{ticker}'. "
+        "Verifica que el ticker sea válido."
     )
-
 
 def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df = df.copy()
