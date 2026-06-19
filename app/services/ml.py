@@ -3,6 +3,7 @@ ML: Random Forest + Gradient Boosting
 pandas>=2.3.2 + pandas-ta 0.4.71b0 + scikit-learn 1.5.1
 """
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -20,6 +21,15 @@ from app.models import MLPredictionResponse, PredictionPoint
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _sf(v, default: float = 0.0) -> float:
+    """Convierte cualquier float a un valor JSON-safe (sin nan/inf)."""
+    try:
+        f = float(v)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return default
 
 
 def _find_col(df: pd.DataFrame, *prefixes: str) -> Optional[str]:
@@ -86,7 +96,6 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     if sma50:  df["dist_sma50"]  = (closes - df[sma50])  / (df[sma50]  + 1e-9)
     if sma200: df["dist_sma200"] = (closes - df[sma200]) / (df[sma200] + 1e-9)
 
-    # Build feature list from what's actually available
     base_features = [
         sma50, sma200,
         _find_col(df, "EMA_50"), _find_col(df, "EMA_200"),
@@ -98,7 +107,7 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         _find_col(df, "ATRr_14"),
         "return_1d", "return_5d", "return_10d", "return_20d",
         "volatility_20d", "volume_ratio",
-        "dist_sma50" if "dist_sma50" in df.columns else None,
+        "dist_sma50"  if "dist_sma50"  in df.columns else None,
         "dist_sma200" if "dist_sma200" in df.columns else None,
     ]
     feature_cols = [f for f in base_features if f is not None and f in df.columns]
@@ -106,23 +115,35 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 
 def _build_prediction_points(df_raw, last_close, mean_ret, std_ret, days_ahead):
+    # Sanear entradas — si son nan/inf el modelo no tiene predicción válida
+    mean_ret   = _sf(mean_ret,  0.0)
+    std_ret    = _sf(std_ret,   0.01)
+    last_close = _sf(last_close, 100.0)
+
     points = []
     last_date = df_raw.index[-1]
     if hasattr(last_date, "to_pydatetime"):
         last_date = last_date.to_pydatetime()
-    business_day = 0; current_date = last_date
+    business_day = 0
+    current_date = last_date
     while business_day < days_ahead:
         current_date = current_date + timedelta(days=1)
-        if current_date.weekday() >= 5: continue
+        if current_date.weekday() >= 5:
+            continue
         business_day += 1
         frac = business_day / days_ahead
-        dr = mean_ret * frac; ds = std_ret * frac * 1.5
+        dr = mean_ret * frac
+        ds = std_ret * frac * 1.5
+        pred  = round(_sf(last_close * (1 + dr),            last_close), 2)
+        lower = round(_sf(last_close * (1 + dr - 1.96 * ds), pred * 0.95), 2)
+        upper = round(_sf(last_close * (1 + dr + 1.96 * ds), pred * 1.05), 2)
+        conf  = round(_sf(max(0.0, min(1.0, 1.0 - abs(dr) - ds * 2)),    0.5), 4)
         points.append(PredictionPoint(
             date=current_date.strftime("%Y-%m-%d"),
-            predicted_price=round(last_close * (1 + dr), 2),
-            lower_bound=round(last_close * (1 + dr - 1.96 * ds), 2),
-            upper_bound=round(last_close * (1 + dr + 1.96 * ds), 2),
-            confidence=round(max(0.0, min(1.0, 1.0 - abs(dr) - ds * 2)), 4),
+            predicted_price=pred,
+            lower_bound=lower,
+            upper_bound=upper,
+            confidence=conf,
         ))
     return points
 
@@ -146,7 +167,8 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     tr, te = list(tscv.split(X))[-1]
 
     scaler = StandardScaler()
-    Xtr = scaler.fit_transform(X[tr]); Xte = scaler.transform(X[te])
+    Xtr = scaler.fit_transform(X[tr])
+    Xte = scaler.transform(X[te])
 
     model = RandomForestRegressor(
         n_estimators=200, max_depth=8, min_samples_leaf=5,
@@ -156,22 +178,20 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
 
     y_pred = model.predict(Xte)
     try:
-        mape = float(mean_absolute_percentage_error(y[te], y_pred))
+        mape = _sf(mean_absolute_percentage_error(y[te], y_pred), 0.0)
     except Exception:
         mape = 0.0
-    mape = float(np.nan_to_num(mape, nan=0.0, posinf=99.0, neginf=0.0))
-    rmse = float(np.nan_to_num(np.sqrt(mean_squared_error(y[te], y_pred)), nan=0.0, posinf=99.0, neginf=0.0))
+    rmse = _sf(np.sqrt(mean_squared_error(y[te], y_pred)), 0.0)
 
-    last_row = X[-1].copy()
-    last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
+    last_row = np.nan_to_num(X[-1].copy(), nan=0.0, posinf=0.0, neginf=0.0)
     last_s     = scaler.transform(last_row.reshape(1, -1))
     tree_preds = np.array([t.predict(last_s)[0] for t in model.estimators_])
-    pred_mean  = float(np.nan_to_num(model.predict(last_s)[0], nan=0.0))
-    pred_std   = float(np.nan_to_num(tree_preds.std(), nan=0.01))
-    last_close = float(df_raw["Close"].iloc[-1])
+    pred_mean  = _sf(model.predict(last_s)[0], 0.0)
+    pred_std   = _sf(tree_preds.std(), 0.01)
+    last_close = _sf(df_raw["Close"].iloc[-1], 100.0)
 
     importance = dict(sorted(
-        zip(feature_cols, [round(float(np.nan_to_num(v, nan=0.0)), 4) for v in model.feature_importances_]),
+        zip(feature_cols, [round(_sf(v, 0.0), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
@@ -180,8 +200,10 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
         predictions=_build_prediction_points(df_raw, last_close, pred_mean, pred_std, days_ahead),
         feature_importance=importance,
         accuracy_metrics={
-            "mape": round(mape * 100, 2), "rmse_return": round(rmse * 100, 2),
-            "train_samples": len(y[tr]), "test_samples": len(y[te]),
+            "mape":          round(mape * 100, 2),
+            "rmse_return":   round(rmse * 100, 2),
+            "train_samples": len(y[tr]),
+            "test_samples":  len(y[te]),
         },
         last_updated=datetime.now().isoformat(),
     )
@@ -206,7 +228,8 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
     tr, te = list(tscv.split(X))[-1]
 
     scaler = StandardScaler()
-    Xtr = scaler.fit_transform(X[tr]); Xte = scaler.transform(X[te])
+    Xtr = scaler.fit_transform(X[tr])
+    Xte = scaler.transform(X[te])
 
     model = GradientBoostingRegressor(
         n_estimators=150, learning_rate=0.05,
@@ -216,20 +239,19 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
 
     y_pred = model.predict(Xte)
     try:
-        mape = float(mean_absolute_percentage_error(y[te], y_pred))
+        mape = _sf(mean_absolute_percentage_error(y[te], y_pred), 0.0)
     except Exception:
         mape = 0.0
-    mape = float(np.nan_to_num(mape, nan=0.0, posinf=99.0, neginf=0.0))
-    last_row = X[-1].copy()
-    last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
-    last_s     = scaler.transform(last_row.reshape(1, -1))
-    pred_mean  = float(np.nan_to_num(model.predict(last_s)[0], nan=0.0))
-    staged     = list(model.staged_predict(last_s))
-    pred_std   = float(np.nan_to_num(np.std([p[0] for p in staged[-50:]]), nan=0.01)) if len(staged) >= 50 else abs(pred_mean) * 0.5
-    last_close = float(df_raw["Close"].iloc[-1])
 
-   importance = dict(sorted(
-        zip(feature_cols, [round(float(np.nan_to_num(v, nan=0.0)), 4) for v in model.feature_importances_]),
+    last_row  = np.nan_to_num(X[-1].copy(), nan=0.0, posinf=0.0, neginf=0.0)
+    last_s    = scaler.transform(last_row.reshape(1, -1))
+    pred_mean = _sf(model.predict(last_s)[0], 0.0)
+    staged    = list(model.staged_predict(last_s))
+    pred_std  = _sf(np.std([p[0] for p in staged[-50:]]), 0.01) if len(staged) >= 50 else abs(pred_mean) * 0.5
+    last_close = _sf(df_raw["Close"].iloc[-1], 100.0)
+
+    importance = dict(sorted(
+        zip(feature_cols, [round(_sf(v, 0.0), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
@@ -237,6 +259,9 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
         ticker=ticker, model="gradient-boosting", days_ahead=days_ahead,
         predictions=_build_prediction_points(df_raw, last_close, pred_mean, pred_std, days_ahead),
         feature_importance=importance,
-        accuracy_metrics={"mape": round(mape * 100, 2), "test_samples": len(y[te])},
+        accuracy_metrics={
+            "mape":         round(mape * 100, 2),
+            "test_samples": len(y[te]),
+        },
         last_updated=datetime.now().isoformat(),
     )
