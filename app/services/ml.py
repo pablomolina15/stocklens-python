@@ -297,7 +297,7 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
             "rmse_norm":     round(rmse, 4),
             "train_samples": len(y[tr]),
             "test_samples":  len(y[te]),
-            "train_period":  TRAIN_PERIOD,
+            #"train_period":  TRAIN_PERIOD,
             "vol_mean_pct":  round(vol_mean * 100, 3),
         },
         last_updated=datetime.now().isoformat(),
@@ -370,7 +370,7 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
         accuracy_metrics={
             "mape":         round(mape * 100, 2),
             "test_samples": len(y[te]),
-            "train_period": TRAIN_PERIOD,
+            #"train_period": TRAIN_PERIOD,
             "vol_mean_pct": round(vol_mean * 100, 3),
         },
         last_updated=datetime.now().isoformat(),
