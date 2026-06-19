@@ -211,6 +211,7 @@ def _build_prediction_points(
         frac     = business_day / days_ahead
         day_ret  = pred_return * frac
         day_std  = pred_std_price * (frac ** 0.5)
+        day_ret = _clamp(day_ret, 1)  # clamp cada punto individualmente
 
         pred  = round(_sf(last_close * (1 + day_ret),               last_close),       2)
         lower = round(_sf(last_close * (1 + day_ret - 1.96 * day_std), pred * 0.97),  2)
