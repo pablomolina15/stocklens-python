@@ -273,7 +273,7 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
     # Busca el último close válido (no nan)
     last_close = float(df_raw['Close'].dropna().iloc[-1])
     if math.isnan(last_close) or last_close <= 0:
-    raise ValueError(f"Precio de cierre inválido para {ticker}")
+        raise ValueError(f"Precio de cierre inválido para {ticker}")
 
     # ✅ FIX: Clamp implied_return to ±5% to prevent lunatic predictions.
     # The LSTM captures direction but magnitude is unreliable without full backprop.
