@@ -158,10 +158,12 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     mape = float(mean_absolute_percentage_error(y[te], y_pred))
     rmse = float(np.sqrt(mean_squared_error(y[te], y_pred)))
 
-    last_s     = scaler.transform(X[-1].reshape(1, -1))
+    last_row = X[-1].copy()
+    last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
+    last_s     = scaler.transform(last_row.reshape(1, -1))
     tree_preds = np.array([t.predict(last_s)[0] for t in model.estimators_])
-    pred_mean  = float(model.predict(last_s)[0])
-    pred_std   = float(tree_preds.std())
+    pred_mean  = float(np.nan_to_num(model.predict(last_s)[0], nan=0.0))
+    pred_std   = float(np.nan_to_num(tree_preds.std(), nan=0.01))
     last_close = float(df_raw["Close"].iloc[-1])
 
     importance = dict(sorted(
@@ -210,10 +212,12 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
 
     y_pred     = model.predict(Xte)
     mape       = float(mean_absolute_percentage_error(y[te], y_pred))
-    last_s     = scaler.transform(X[-1].reshape(1, -1))
-    pred_mean  = float(model.predict(last_s)[0])
+    last_row = X[-1].copy()
+    last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
+    last_s     = scaler.transform(last_row.reshape(1, -1))
+    pred_mean  = float(np.nan_to_num(model.predict(last_s)[0], nan=0.0))
     staged     = list(model.staged_predict(last_s))
-    pred_std   = float(np.std([p[0] for p in staged[-50:]])) if len(staged) >= 50 else abs(pred_mean) * 0.5
+    pred_std   = float(np.nan_to_num(np.std([p[0] for p in staged[-50:]]), nan=0.01)) if len(staged) >= 50 else abs(pred_mean) * 0.5
     last_close = float(df_raw["Close"].iloc[-1])
 
     importance = dict(sorted(
