@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Warmup flag ────────────────────────────────────────────────────────────────
 _warmed_up = False
 
 
@@ -27,7 +26,6 @@ async def lifespan(app: FastAPI):
     global _warmed_up
     logger.info("🚀 StockLens Python Service starting")
     logger.info("   CORS: %s", settings.cors_origins)
-    # Routers are already registered; no heavy import needed at startup
     _warmed_up = True
     yield
     logger.info("🛑 StockLens shutting down")
@@ -35,8 +33,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="StockLens API",
-    description="Análisis técnico, fundamental y ML — yfinance + pandas-ta + scikit-learn",
-    version="1.0.0",
+    description="Análisis técnico, fundamental, ML y scanner multi-señal",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -49,22 +47,23 @@ app.add_middleware(
 )
 
 
-# ── Health — registered BEFORE routers so it's always fast ───────────────────
 @app.get("/", tags=["Health"])
 @app.get("/health", tags=["Health"])
 async def health():
     return {
         "status": "ok",
         "service": "stocklens-python",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "warmed_up": _warmed_up,
         "supabase": "configured" if settings.supabase_url else "not configured",
     }
 
 
-# ── Routers imported AFTER health so startup is instant for healthcheck ───────
+# Lazy imports after health endpoint
 from app.routers import technical, fundamental, ml  # noqa: E402
+from app.routers import scanner                      # noqa: E402
 
 app.include_router(technical.router,   prefix="/analyze", tags=["Technical"])
 app.include_router(fundamental.router, prefix="/analyze", tags=["Fundamental"])
 app.include_router(ml.router,          prefix="/predict", tags=["ML"])
+app.include_router(scanner.router,     prefix="/scan",    tags=["Scanner"])  # ← NEW
