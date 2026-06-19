@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 
 # Training window — 6 months is enough to capture current regime
 # without overfitting to historical crashes from 2+ years ago
-TRAIN_PERIOD   = "6mo"
-MIN_ROWS       = 80       # minimum rows after feature engineering
-NORM_WINDOW    = 60       # days for volatility normalization of target
+TRAIN_PERIOD   = "1y"
+MIN_ROWS       = 60       # minimum rows after feature engineering
+NORM_WINDOW    = 40       # days for volatility normalization of target
 
 # Safety clamp — last line of defense against absurd predictions
 MAX_DAILY_RET  = 0.03     # 3% max per day implied
@@ -155,7 +155,7 @@ def _normalize_target(df: pd.DataFrame, days_ahead: int) -> tuple[pd.Series, flo
     raw_return = df["Close"].shift(-days_ahead) / df["Close"] - 1
 
     # Rolling volatility over NORM_WINDOW days
-    roll_vol = df["Close"].pct_change().rolling(NORM_WINDOW, min_periods=20).std()
+    roll_vol = df["Close"].pct_change().rolling(NORM_WINDOW, min_periods=10).std()
     roll_vol = roll_vol.replace(0, np.nan).ffill().fillna(0.01)
 
     # Normalize: how many "typical daily moves" is this return?
@@ -244,7 +244,7 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     X = df_clean[feature_cols].values
     y = df_clean["target"].values
 
-    tscv = TimeSeriesSplit(n_splits=3)  # 3 splits for 6mo window (5 would be too small)
+    tscv = TimeSeriesSplit(n_splits=5)  # 5 splits for 1y window 
     tr, te = list(tscv.split(X))[-1]
 
     scaler = StandardScaler()
