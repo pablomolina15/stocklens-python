@@ -315,6 +315,30 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
             confidence=conf,
         ))
 
+# Sanitize metrics against nan/inf
+    import math
+    def _sf(v, d=0.0):
+        try:
+            f = float(v)
+            return d if (math.isnan(f) or math.isinf(f)) else f
+        except Exception:
+            return d
+
+    mape     = _sf(mape, 0.0)
+    mae      = _sf(mae, 0.0)
+    implied_return = _sf(implied_return, 0.0)
+
+    # Sanitize prediction points
+    predictions = [
+        PredictionPoint(
+            date=p.date,
+            predicted_price=_sf(p.predicted_price, last_close),
+            lower_bound=_sf(p.lower_bound, last_close * 0.95),
+            upper_bound=_sf(p.upper_bound, last_close * 1.05),
+            confidence=_sf(p.confidence, 0.5),
+        )
+        for p in predictions
+    ]
     feature_names = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
 
     return MLPredictionResponse(
