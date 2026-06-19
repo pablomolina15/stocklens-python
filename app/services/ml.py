@@ -155,8 +155,12 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     model.fit(Xtr, y[tr])
 
     y_pred = model.predict(Xte)
-    mape = float(mean_absolute_percentage_error(y[te], y_pred))
-    rmse = float(np.sqrt(mean_squared_error(y[te], y_pred)))
+    try:
+        mape = float(mean_absolute_percentage_error(y[te], y_pred))
+    except Exception:
+        mape = 0.0
+    mape = float(np.nan_to_num(mape, nan=0.0, posinf=99.0, neginf=0.0))
+    rmse = float(np.nan_to_num(np.sqrt(mean_squared_error(y[te], y_pred)), nan=0.0, posinf=99.0, neginf=0.0))
 
     last_row = X[-1].copy()
     last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
@@ -167,7 +171,7 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     last_close = float(df_raw["Close"].iloc[-1])
 
     importance = dict(sorted(
-        zip(feature_cols, [round(float(v), 4) for v in model.feature_importances_]),
+        zip(feature_cols, [round(float(np.nan_to_num(v, nan=0.0)), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
@@ -210,8 +214,12 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
     )
     model.fit(Xtr, y[tr])
 
-    y_pred     = model.predict(Xte)
-    mape       = float(mean_absolute_percentage_error(y[te], y_pred))
+    y_pred = model.predict(Xte)
+    try:
+        mape = float(mean_absolute_percentage_error(y[te], y_pred))
+    except Exception:
+        mape = 0.0
+    mape = float(np.nan_to_num(mape, nan=0.0, posinf=99.0, neginf=0.0))
     last_row = X[-1].copy()
     last_row = np.nan_to_num(last_row, nan=0.0, posinf=0.0, neginf=0.0)
     last_s     = scaler.transform(last_row.reshape(1, -1))
@@ -220,8 +228,8 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
     pred_std   = float(np.nan_to_num(np.std([p[0] for p in staged[-50:]]), nan=0.01)) if len(staged) >= 50 else abs(pred_mean) * 0.5
     last_close = float(df_raw["Close"].iloc[-1])
 
-    importance = dict(sorted(
-        zip(feature_cols, [round(float(v), 4) for v in model.feature_importances_]),
+   importance = dict(sorted(
+        zip(feature_cols, [round(float(np.nan_to_num(v, nan=0.0)), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
