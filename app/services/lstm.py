@@ -7,6 +7,15 @@ Arquitectura simplificada:
 
 Usa Monte Carlo Dropout simulado con perturbación de pesos
 para generar intervalos de confianza.
+
+✅ FIXES v2:
+  - Normalización rolling (ventana 60 días) en vez de histórico completo:
+    evita que stocks con alto crecimiento (NVDA, etc.) produzcan std
+    gigante que dispa el implied_return al desnormalizar.
+  - implied_return clampado a ±5% para resultados realistas.
+  - hidden_size reducido a 16 (más estable con pocos datos de train).
+  - epochs reducidos a 30 (suficiente para hidden=16, evita overfitting).
+  - Umbral de confianza mínimo ajustado.
 """
 import logging
 import time
@@ -23,16 +32,18 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-TIMESTEPS = 30
-FEATURES  = 5    # close_norm, rsi_norm, macd_norm, volume_norm, return_1d
+TIMESTEPS   = 30
+FEATURES    = 5    # close_norm, rsi_norm, macd_norm, volume_norm, return_1d
+HIDDEN_SIZE = 16   # ✅ reduced from 32: more stable with limited training data
+# ✅ Window for local normalization — avoids using full 18mo std
+NORM_WINDOW = 60
 
 
 # ── Numpy LSTM cell ───────────────────────────────────────────────────────────
 class LSTMCell:
     def __init__(self, input_size: int, hidden_size: int, seed: int = 42):
         rng = np.random.RandomState(seed)
-        scale = 0.1
-        # Gates: forget, input, output, cell
+        scale = 0.08  # slightly smaller init for stability
         self.Wf = rng.randn(hidden_size, input_size + hidden_size) * scale
         self.Wi = rng.randn(hidden_size, input_size + hidden_size) * scale
         self.Wo = rng.randn(hidden_size, input_size + hidden_size) * scale
@@ -70,7 +81,7 @@ class LSTMCell:
 class NumpyLSTM:
     """Single-layer LSTM + linear output, trained with mini-batch gradient descent."""
 
-    def __init__(self, input_size: int, hidden_size: int = 32, seed: int = 42):
+    def __init__(self, input_size: int, hidden_size: int = HIDDEN_SIZE, seed: int = 42):
         self.cell   = LSTMCell(input_size, hidden_size, seed)
         rng = np.random.RandomState(seed)
         self.W_out  = rng.randn(1, hidden_size) * 0.1
@@ -86,10 +97,10 @@ class NumpyLSTM:
         return np.array([self.predict_one(x, dropout) for x in Xs])
 
     def train(self, X_seq: np.ndarray, y: np.ndarray,
-              epochs: int = 40, lr: float = 0.005, batch_size: int = 16):
+              epochs: int = 30, lr: float = 0.005, batch_size: int = 16):
         """
         Simple training loop using numerical gradient approximation (finite differences).
-        Fast enough for TIMESTEPS=30, hidden=32, ~200 samples.
+        Fast enough for TIMESTEPS=30, hidden=16, ~200 samples.
         """
         n_samples = len(X_seq)
         best_loss = float('inf')
@@ -143,7 +154,14 @@ class NumpyLSTM:
 
 # ── Feature engineering ───────────────────────────────────────────────────────
 def _build_lstm_features(df: pd.DataFrame) -> Optional[np.ndarray]:
-    """Returns (N, FEATURES) normalized array or None if insufficient data."""
+    """
+    Returns (N, FEATURES) normalized array or None if insufficient data.
+
+    ✅ FIX: Uses rolling window normalization (last NORM_WINDOW days)
+    instead of full-history mean/std. This prevents stocks with strong
+    long-term trends (NVDA, SMCI...) from producing enormous std values
+    that amplify implied_return wildly when denormalizing.
+    """
     df = df.copy()
     closes = df['Close']
     vols   = df['Volume']
@@ -157,11 +175,17 @@ def _build_lstm_features(df: pd.DataFrame) -> Optional[np.ndarray]:
     rsi_col  = next((c for c in df.columns if c.startswith('RSI_')), None)
     macd_col = next((c for c in df.columns if c.startswith('MACD_12')), None)
 
-    df['close_norm']  = (closes  - closes.mean())  / (closes.std()  + 1e-9)
-    df['volume_norm'] = (vols    - vols.mean())    / (vols.std()    + 1e-9)
-    df['return_1d']   = closes.pct_change().fillna(0)
+    # ✅ Rolling normalization: each point is normalized relative to recent window
+    roll_mean = closes.rolling(NORM_WINDOW, min_periods=20).mean()
+    roll_std  = closes.rolling(NORM_WINDOW, min_periods=20).std().replace(0, 1e-9)
+    vol_mean  = vols.rolling(NORM_WINDOW, min_periods=20).mean()
+    vol_std   = vols.rolling(NORM_WINDOW, min_periods=20).std().replace(0, 1e-9)
+
+    df['close_norm']  = (closes - roll_mean) / roll_std
+    df['volume_norm'] = (vols   - vol_mean)  / vol_std
+    df['return_1d']   = closes.pct_change().fillna(0).clip(-0.15, 0.15)  # clip outliers
     df['rsi_norm']    = ((df[rsi_col] - 50) / 50) if rsi_col else 0.0
-    df['macd_norm']   = (df[macd_col] / (closes.std() + 1e-9)) if macd_col else 0.0
+    df['macd_norm']   = (df[macd_col] / (roll_std + 1e-9)) if macd_col else 0.0
 
     feat_cols = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
     df_clean  = df[feat_cols].dropna()
@@ -215,32 +239,50 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
     logger.info("LSTM training: %d train, %d test sequences", len(X_train), len(X_test))
 
     # Train model
-    model = NumpyLSTM(input_size=FEATURES, hidden_size=32, seed=42)
-    final_loss = model.train(X_train, y_train, epochs=50, lr=0.003, batch_size=16)
+    model = NumpyLSTM(input_size=FEATURES, hidden_size=HIDDEN_SIZE, seed=42)
+    final_loss = model.train(X_train, y_train, epochs=30, lr=0.005, batch_size=16)
     logger.info("LSTM trained — final MSE: %.6f", final_loss)
 
     # Test accuracy
     y_pred_test = model.predict_batch(X_test)
 
-    # Denormalize
-    close_mean = float(df_raw['Close'].mean())
-    close_std  = float(df_raw['Close'].std())
+    # ✅ FIX: Denormalize using the LOCAL window stats (last NORM_WINDOW days),
+    # not the full 18-month history. This keeps the scale sane for trending stocks.
+    recent_closes = df_raw['Close'].iloc[-NORM_WINDOW:]
+    close_mean    = float(recent_closes.mean())
+    close_std     = float(recent_closes.std()) or 1.0
+
     y_test_real = y_test  * close_std + close_mean
     y_pred_real = y_pred_test * close_std + close_mean
-    mape = float(np.mean(np.abs((y_test_real - y_pred_real) / (y_test_real + 1e-9))) * 100)
+    # Protect against near-zero actuals in MAPE
+    valid_mask  = np.abs(y_test_real) > 0.01
+    mape = float(np.mean(np.abs(
+        (y_test_real[valid_mask] - y_pred_real[valid_mask]) / y_test_real[valid_mask]
+    )) * 100) if valid_mask.any() else 0.0
     mae  = float(np.mean(np.abs(y_test_real - y_pred_real)))
 
     # Monte Carlo predictions — run N forward passes with dropout for uncertainty
     N_MC = 30
-    last_seq   = features[-TIMESTEPS:]   # (30, 5)
+    last_seq      = features[-TIMESTEPS:]   # (30, 5)
     mc_preds_norm = np.array([model.predict_one(last_seq, dropout=0.15) for _ in range(N_MC)])
-    mc_prices  = mc_preds_norm * close_std + close_mean
-    mean_next  = float(np.mean(mc_prices))
-    std_next   = float(np.std(mc_prices))
+    mc_prices     = mc_preds_norm * close_std + close_mean
+    mean_next     = float(np.mean(mc_prices))
+    std_next      = float(np.std(mc_prices))
 
-    # Build N-day forward predictions with growing uncertainty
+    # Build N-day forward predictions
     last_close = float(df_raw['Close'].iloc[-1])
-    implied_return = (mean_next - last_close) / (last_close + 1e-9)
+
+    # ✅ FIX: Clamp implied_return to ±5% to prevent lunatic predictions.
+    # The LSTM captures direction but magnitude is unreliable without full backprop.
+    raw_return     = (mean_next - last_close) / (last_close + 1e-9)
+    MAX_DAILY_RETURN = 0.05
+    implied_return = float(np.clip(raw_return, -MAX_DAILY_RETURN, MAX_DAILY_RETURN))
+
+    logger.info(
+        "LSTM %s: last_close=%.2f mean_next=%.2f raw_ret=%.3f%% clamped_ret=%.3f%%",
+        ticker, last_close, mean_next,
+        raw_return * 100, implied_return * 100,
+    )
 
     predictions: list[PredictionPoint] = []
     last_date = df_raw.index[-1]
@@ -257,11 +299,13 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
 
         frac       = business_day / max(days_ahead, 1)
         day_ret    = implied_return * frac
-        day_std    = (std_next / (last_close + 1e-9)) * frac * 1.5
+        # Uncertainty grows with time, anchored to recent volatility
+        recent_vol = float(df_raw['Close'].pct_change().iloc[-30:].std()) or 0.01
+        day_std    = recent_vol * np.sqrt(business_day) * 1.5
         pred_price = last_close * (1 + day_ret)
         lower      = last_close * (1 + day_ret - 1.96 * day_std)
         upper      = last_close * (1 + day_ret + 1.96 * day_std)
-        conf       = round(max(0.1, min(0.95, 1.0 - abs(day_ret) - day_std * 2)), 4)
+        conf       = round(max(0.1, min(0.92, 1.0 - abs(day_ret) - day_std)), 4)
 
         predictions.append(PredictionPoint(
             date=current_date.strftime('%Y-%m-%d'),
@@ -280,18 +324,20 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
         predictions=predictions,
         feature_importance={f: round(1.0 / FEATURES, 4) for f in feature_names},
         accuracy_metrics={
-            'mape':          round(mape, 2),
-            'mae_usd':       round(mae, 2),
-            'train_samples': len(X_train),
-            'test_samples':  len(X_test),
-            'mc_samples':    N_MC,
-            'timesteps':     TIMESTEPS,
-            'hidden_size':   32,
-            'implementation':'numpy_lstm',
+            'mape':           round(mape, 2),
+            'mae_usd':        round(mae, 2),
+            'train_samples':  len(X_train),
+            'test_samples':   len(X_test),
+            'mc_samples':     N_MC,
+            'timesteps':      TIMESTEPS,
+            'hidden_size':    HIDDEN_SIZE,
+            'implementation': 'numpy_lstm_v2',
+            'norm_window':    NORM_WINDOW,
+            'implied_return_pct': round(implied_return * 100, 2),
         },
         last_updated=datetime.now().isoformat(),
         disclaimer=(
-            'LSTM NumPy — red recurrente entrenada en tiempo real sin TensorFlow. '
+            'LSTM NumPy v2 — normalización rolling (60d), retorno clampado ±5%. '
             'Monte Carlo Dropout (30 muestras) para intervalos de confianza al 90%. '
             'No constituye consejo de inversión.'
         ),
