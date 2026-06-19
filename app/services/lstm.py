@@ -18,6 +18,7 @@ para generar intervalos de confianza.
   - Umbral de confianza mínimo ajustado.
 """
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -319,7 +320,6 @@ def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
         ))
 
 # Sanitize metrics against nan/inf
-    import math
     def _sf(v, d=0.0):
         try:
             f = float(v)
