@@ -1,16 +1,6 @@
 """
 ML: Random Forest + Gradient Boosting
 pandas>=2.3.2 + pandas-ta 0.4.71b0 + scikit-learn 1.5.1
-
-✅ FIXES v4:
-  - Ventana de entrenamiento: 6 meses (antes 3 años).
-    Evita que crashes históricos de hace 2 años contaminen la predicción.
-  - Target normalizado por volatilidad reciente (60d):
-    En vez de predecir retorno bruto, predice retorno en sigmas.
-    Al desnormalizar, el resultado es proporcional al riesgo actual
-    de la acción — no al crash que tuvo hace 2 años.
-  - Clamp final a ±3% diario / ±15% absoluto como última red de seguridad.
-  - _sf() sanitiza todos los floats antes del JSON.
 """
 import logging
 import math
@@ -32,19 +22,13 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Training window — 6 months is enough to capture current regime
-# without overfitting to historical crashes from 2+ years ago
-# TRAIN_PERIOD   = "6mo" #ya no hace falta esta linea
-MIN_ROWS       = 50       # minimum rows after feature engineering
-NORM_WINDOW    = 30       # days for volatility normalization of target
-
-# Safety clamp — last line of defense against absurd predictions
-MAX_DAILY_RET  = 0.02   # 2% max per day implied     # 3% max per day implied
-MAX_ABS_RET    = 0.10   # 10% absolute ceiling     # 15% absolute ceiling
+MIN_ROWS      = 50
+NORM_WINDOW   = 30
+MAX_DAILY_RET = 0.02
+MAX_ABS_RET   = 0.10
 
 
 def _sf(v, default: float = 0.0) -> float:
-    """Convierte cualquier float a valor JSON-safe (sin nan/inf)."""
     try:
         f = float(v)
         return default if (math.isnan(f) or math.isinf(f)) else f
@@ -53,9 +37,16 @@ def _sf(v, default: float = 0.0) -> float:
 
 
 def _clamp(ret: float, days_ahead: int) -> float:
-    """Limita el retorno predicho a un rango plausible."""
     cap = min(MAX_ABS_RET, MAX_DAILY_RET * days_ahead)
     return float(np.clip(ret, -cap, cap))
+
+
+def _last_close(df: pd.DataFrame) -> float:
+    """Obtiene el último precio de cierre válido (sin nan)."""
+    closes = df["Close"].dropna()
+    if closes.empty:
+        return 100.0
+    return _sf(float(closes.iloc[-1]), 100.0)
 
 
 def _find_col(df: pd.DataFrame, *prefixes: str) -> Optional[str]:
@@ -80,10 +71,8 @@ def _download(ticker: str) -> pd.DataFrame:
                 logger.warning("Download attempt %d/%s for %s: %s", attempt + 1, period, ticker, e)
                 if attempt < settings.max_retries - 1:
                     time.sleep(settings.retry_delay)
-    raise ValueError(
-        f"No se pudieron descargar datos suficientes para '{ticker}'. "
-        "Verifica que el ticker sea válido."
-    )
+    raise ValueError(f"No se pudieron descargar datos suficientes para '{ticker}'.")
+
 
 def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df = df.copy()
@@ -102,7 +91,6 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     except Exception as e:
         logger.warning("pandas-ta error: %s", e)
 
-    # Short-term returns (most predictive over 6mo window)
     for n in [1, 3, 5, 10]:
         df[f"return_{n}d"] = closes.pct_change(n)
 
@@ -140,40 +128,16 @@ def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 
 def _normalize_target(df: pd.DataFrame, days_ahead: int) -> tuple[pd.Series, float, float]:
-    """
-    Build a volatility-normalized target.
-
-    Instead of predicting raw return (which is dominated by the stock's
-    long-term trend), we predict return / recent_volatility (z-score units).
-    This makes the model focus on whether the current setup is strong/weak
-    relative to the stock's OWN recent behavior — not vs. a 2-year crash.
-
-    Returns:
-        target_series: normalized return series
-        vol_mean:      rolling vol mean (for denormalization)
-        vol_std:       rolling vol std  (for denormalization)
-    """
     raw_return = df["Close"].shift(-days_ahead) / df["Close"] - 1
-
-    # Rolling volatility over NORM_WINDOW days
     roll_vol = df["Close"].pct_change().rolling(NORM_WINDOW, min_periods=20).std()
     roll_vol = roll_vol.replace(0, np.nan).ffill().fillna(0.01)
-
-    # Normalize: how many "typical daily moves" is this return?
     normalized = raw_return / (roll_vol * np.sqrt(days_ahead) + 1e-9)
-
-    # Clip extreme training targets (e.g. earnings gaps) to ±3 sigma
     normalized = normalized.clip(-3.0, 3.0)
-
-    # Stats for denormalization at prediction time
     recent_vol = float(roll_vol.iloc[-1])
-    vol_mean   = recent_vol  # use current vol for denormalization
-
-    return normalized, vol_mean, float(roll_vol.std() or 0.005)
+    return normalized, recent_vol, float(roll_vol.std() or 0.005)
 
 
 def _denormalize_prediction(pred_norm: float, vol_mean: float, days_ahead: int) -> float:
-    """Convert normalized prediction back to price return."""
     raw = pred_norm * vol_mean * np.sqrt(days_ahead)
     return _clamp(_sf(raw, 0.0), days_ahead)
 
@@ -181,8 +145,8 @@ def _denormalize_prediction(pred_norm: float, vol_mean: float, days_ahead: int) 
 def _build_prediction_points(
     df_raw: pd.DataFrame,
     last_close: float,
-    pred_return: float,   # already denormalized and clamped
-    pred_std_norm: float, # in normalized units
+    pred_return: float,
+    pred_std_norm: float,
     vol_mean: float,
     days_ahead: int,
 ) -> list[PredictionPoint]:
@@ -190,11 +154,19 @@ def _build_prediction_points(
     pred_return   = _sf(pred_return, 0.0)
     pred_std_norm = _sf(pred_std_norm, 0.1)
     vol_mean      = _sf(vol_mean, 0.01)
-    # Clamp pred_return total antes del bucle
-    pred_return = float(np.clip(pred_return, -0.10, 0.10))
-    # Convert std to price units for confidence intervals
+
+    # Clamp total return
+    pred_return = float(np.clip(pred_return, -MAX_ABS_RET, MAX_ABS_RET))
+
     pred_std_price = pred_std_norm * vol_mean * np.sqrt(days_ahead)
     pred_std_price = float(np.clip(pred_std_price, 0.005, 0.12))
+
+    # Price clamp bounds based on REAL last_close
+    max_price = last_close * (1 + MAX_ABS_RET)
+    min_price = last_close * (1 - MAX_ABS_RET)
+
+    logger.info("Building points: last_close=%.2f min=%.2f max=%.2f pred_return=%.3f",
+                last_close, min_price, max_price, pred_return)
 
     points: list[PredictionPoint] = []
     last_date = df_raw.index[-1]
@@ -209,28 +181,20 @@ def _build_prediction_points(
             continue
         business_day += 1
 
-        frac     = business_day / days_ahead
-        day_ret  = pred_return * frac
-        day_std  = pred_std_price * (frac ** 0.5)
-        day_ret = _clamp(day_ret, 1)  # clamp cada punto individualmente
+        frac    = business_day / days_ahead
+        day_ret = float(np.clip(pred_return * frac, -MAX_ABS_RET, MAX_ABS_RET))
+        day_std = pred_std_price * (frac ** 0.5)
 
-        pred  = round(_sf(last_close * (1 + day_ret),               last_close),       2)
-        lower = round(_sf(last_close * (1 + day_ret - 1.96 * day_std), pred * 0.97),  2)
-        upper = round(_sf(last_close * (1 + day_ret + 1.96 * day_std), pred * 1.03),  2)
+        pred  = float(np.clip(last_close * (1 + day_ret),               min_price, max_price))
+        lower = float(np.clip(last_close * (1 + day_ret - 1.96 * day_std), last_close * 0.85, last_close * 1.15))
+        upper = float(np.clip(last_close * (1 + day_ret + 1.96 * day_std), last_close * 0.85, last_close * 1.15))
         conf  = round(_sf(max(0.1, min(0.92, 1.0 - abs(day_ret) * 5 - day_std * 3)), 0.5), 4)
-
-        # Clamp precio final a ±10% del last_close
-        max_price = last_close * 1.10
-        min_price = last_close * 0.90
-        pred  = round(max(min_price, min(max_price, pred)), 2)
-        lower = round(max(last_close * 0.85, min(last_close * 1.15, lower)), 2)
-        upper = round(max(last_close * 0.85, min(last_close * 1.15, upper)), 2)
 
         points.append(PredictionPoint(
             date=current_date.strftime("%Y-%m-%d"),
-            predicted_price=pred,
-            lower_bound=lower,
-            upper_bound=upper,
+            predicted_price=round(pred, 2),
+            lower_bound=round(lower, 2),
+            upper_bound=round(upper, 2),
             confidence=conf,
         ))
     return points
@@ -243,18 +207,17 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
     df_raw = _download(ticker)
     df, feature_cols = _build_features(df_raw)
 
-    # ✅ Volatility-normalized target
     target, vol_mean, vol_std = _normalize_target(df, days_ahead)
     df["target"] = target
     df_clean = df[feature_cols + ["target", "Close"]].dropna()
 
     if len(df_clean) < MIN_ROWS:
-        raise ValueError(f"Datos insuficientes para {ticker}: {len(df_clean)} filas tras feature engineering")
+        raise ValueError(f"Datos insuficientes para {ticker}: {len(df_clean)} filas")
 
     X = df_clean[feature_cols].values
     y = df_clean["target"].values
 
-    tscv = TimeSeriesSplit(n_splits=3)  # 3 splits for 6mo window (5 would be too small)
+    tscv = TimeSeriesSplit(n_splits=3)
     tr, te = list(tscv.split(X))[-1]
 
     scaler = StandardScaler()
@@ -274,24 +237,23 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
         mape = 0.0
     rmse = _sf(np.sqrt(mean_squared_error(y[te], y_pred)), 0.0)
 
-    # Predict on latest data point
     last_row      = np.nan_to_num(X[-1].copy(), nan=0.0, posinf=0.0, neginf=0.0)
     last_s        = scaler.transform(last_row.reshape(1, -1))
     tree_preds    = np.array([_sf(t.predict(last_s)[0]) for t in model.estimators_])
     pred_norm     = _sf(model.predict(last_s)[0], 0.0)
     pred_std_norm = _sf(tree_preds.std(), 0.1)
+    pred_return   = _denormalize_prediction(pred_norm, vol_mean, days_ahead)
 
-    # ✅ Denormalize using current volatility
-    pred_return = _denormalize_prediction(pred_norm, vol_mean, days_ahead)
-    last_close  = _sf(df_raw["Close"].iloc[-1], 100.0)
+    # ✅ FIX: usar _last_close() en vez de .iloc[-1] directamente
+    last_close = _last_close(df_raw)
 
     importance = dict(sorted(
         zip(feature_cols, [round(_sf(v, 0.0), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
-    logger.info("RF %s: pred_norm=%.3f vol_mean=%.4f pred_return=%.2f%%",
-                ticker, pred_norm, vol_mean, pred_return * 100)
+    logger.info("RF %s: last_close=%.2f pred_norm=%.3f vol_mean=%.4f pred_return=%.2f%%",
+                ticker, last_close, pred_norm, vol_mean, pred_return * 100)
 
     return MLPredictionResponse(
         ticker=ticker,
@@ -306,7 +268,6 @@ def predict_random_forest(ticker: str, days_ahead: int = 5) -> MLPredictionRespo
             "rmse_norm":     round(rmse, 4),
             "train_samples": len(y[tr]),
             "test_samples":  len(y[te]),
-            #"train_period":  TRAIN_PERIOD,
             "vol_mean_pct":  round(vol_mean * 100, 3),
         },
         last_updated=datetime.now().isoformat(),
@@ -320,7 +281,6 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
     df_raw = _download(ticker)
     df, feature_cols = _build_features(df_raw)
 
-    # ✅ Volatility-normalized target
     target, vol_mean, vol_std = _normalize_target(df, days_ahead)
     df["target"] = target
     df_clean = df[feature_cols + ["target", "Close"]].dropna()
@@ -355,18 +315,18 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
     pred_norm     = _sf(model.predict(last_s)[0], 0.0)
     staged        = list(model.staged_predict(last_s))
     pred_std_norm = _sf(np.std([p[0] for p in staged[-50:]]), 0.1) if len(staged) >= 50 else 0.1
+    pred_return   = _denormalize_prediction(pred_norm, vol_mean, days_ahead)
 
-    # ✅ Denormalize using current volatility
-    pred_return = _denormalize_prediction(pred_norm, vol_mean, days_ahead)
-    last_close = _sf(float(df_raw["Close"].dropna().iloc[-1]), 100.0)
+    # ✅ FIX: usar _last_close() en vez de .iloc[-1] directamente
+    last_close = _last_close(df_raw)
 
     importance = dict(sorted(
         zip(feature_cols, [round(_sf(v, 0.0), 4) for v in model.feature_importances_]),
         key=lambda x: x[1], reverse=True
     )[:8])
 
-    logger.info("GB %s: pred_norm=%.3f vol_mean=%.4f pred_return=%.2f%%",
-                ticker, pred_norm, vol_mean, pred_return * 100)
+    logger.info("GB %s: last_close=%.2f pred_norm=%.3f vol_mean=%.4f pred_return=%.2f%%",
+                ticker, last_close, pred_norm, vol_mean, pred_return * 100)
 
     return MLPredictionResponse(
         ticker=ticker,
@@ -379,7 +339,6 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
         accuracy_metrics={
             "mape":         round(mape * 100, 2),
             "test_samples": len(y[te]),
-            #"train_period": TRAIN_PERIOD,
             "vol_mean_pct": round(vol_mean * 100, 3),
         },
         last_updated=datetime.now().isoformat(),
