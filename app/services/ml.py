@@ -218,6 +218,13 @@ def _build_prediction_points(
         upper = round(_sf(last_close * (1 + day_ret + 1.96 * day_std), pred * 1.03),  2)
         conf  = round(_sf(max(0.1, min(0.92, 1.0 - abs(day_ret) * 5 - day_std * 3)), 0.5), 4)
 
+        # Clamp precio final a ±10% del last_close
+        max_price = last_close * 1.10
+        min_price = last_close * 0.90
+        pred  = round(max(min_price, min(max_price, pred)), 2)
+        lower = round(max(last_close * 0.85, min(last_close * 1.15, lower)), 2)
+        upper = round(max(last_close * 0.85, min(last_close * 1.15, upper)), 2)
+
         points.append(PredictionPoint(
             date=current_date.strftime("%Y-%m-%d"),
             predicted_price=pred,
