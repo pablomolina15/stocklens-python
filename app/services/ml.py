@@ -358,7 +358,7 @@ def predict_gradient_boosting(ticker: str, days_ahead: int = 5) -> MLPredictionR
 
     # ✅ Denormalize using current volatility
     pred_return = _denormalize_prediction(pred_norm, vol_mean, days_ahead)
-    last_close  = _sf(df_raw["Close"].iloc[-1], 100.0)
+    last_close = _sf(float(df_raw["Close"].dropna().iloc[-1]), 100.0)
 
     importance = dict(sorted(
         zip(feature_cols, [round(_sf(v, 0.0), 4) for v in model.feature_importances_]),
