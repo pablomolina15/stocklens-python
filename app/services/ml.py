@@ -190,7 +190,8 @@ def _build_prediction_points(
     pred_return   = _sf(pred_return, 0.0)
     pred_std_norm = _sf(pred_std_norm, 0.1)
     vol_mean      = _sf(vol_mean, 0.01)
-
+    # Clamp pred_return total antes del bucle
+    pred_return = float(np.clip(pred_return, -0.10, 0.10))
     # Convert std to price units for confidence intervals
     pred_std_price = pred_std_norm * vol_mean * np.sqrt(days_ahead)
     pred_std_price = float(np.clip(pred_std_price, 0.005, 0.12))
