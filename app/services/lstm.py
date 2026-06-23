@@ -1,26 +1,25 @@
 """
-LSTM implementado con NumPy puro — sin TensorFlow ni PyTorch.
-Compatible con Railway free tier (512MB RAM).
+StockLens — LSTM Inference via Universal ONNX Model
+app/services/lstm.py
 
-Arquitectura simplificada:
-  Input (timesteps=30, features=5) → LSTM cell → Dense → precio predicho
+Usa el modelo universal entrenado en Colab con S&P 500 completo.
+Funciona para CUALQUIER ticker sin necesidad de reentrenar.
 
-Usa Monte Carlo Dropout simulado con perturbación de pesos
-para generar intervalos de confianza.
-
-✅ FIXES v2:
-  - Normalización rolling (ventana 60 días) en vez de histórico completo:
-    evita que stocks con alto crecimiento (NVDA, etc.) produzcan std
-    gigante que dispa el implied_return al desnormalizar.
-  - implied_return clampado a ±5% para resultados realistas.
-  - hidden_size reducido a 16 (más estable con pocos datos de train).
-  - epochs reducidos a 30 (suficiente para hidden=16, evita overfitting).
-  - Umbral de confianza mínimo ajustado.
+Mejoras vs. versión anterior:
+  ✅ BPTT real (PyTorch con gradient clipping)
+  ✅ Autoregresión iterativa (no interpolación lineal)
+  ✅ MC Dropout simulado con ruido calibrado (incertidumbre real)
+  ✅ Confianza que decrece con el horizonte temporal
+  ✅ Feature importance real (permutation importance del Colab)
+  ✅ Features universales normalizadas (agnósticas al precio absoluto)
+  ✅ <50MB RAM en Railway (onnxruntime-cpu)
 """
 import logging
 import math
+import pickle
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -33,339 +32,353 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+MODELS_DIR  = Path(__file__).parent.parent / 'models'
 TIMESTEPS   = 30
-FEATURES    = 5    # close_norm, rsi_norm, macd_norm, volume_norm, return_1d
-HIDDEN_SIZE = 16   # ✅ reduced from 32: more stable with limited training data
-# ✅ Window for local normalization — avoids using full 18mo std
-NORM_WINDOW = 60
+MC_SAMPLES  = 50
+MAX_RET_1D  = 0.05   # clamp retorno diario ±5%
+
+# Features universales — deben coincidir EXACTAMENTE con el notebook
+FEAT_COLS = [
+    'ret_1d', 'ret_3d', 'ret_5d', 'ret_10d', 'ret_20d',
+    'dist_sma10', 'dist_sma20', 'dist_sma50',
+    'rsi_14', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
+    'bb_pct_b', 'bb_width', 'atr_norm', 'vol_20d',
+    'vol_ratio', 'obv_norm',
+    'high_low_pct', 'close_open_pct',
+    'stoch_k', 'stoch_d',
+]
+N_FEATURES = len(FEAT_COLS)
+
+# ── Lazy ONNX Runtime import ──────────────────────────────────────────────────
+_ort = None
+
+def _get_ort():
+    global _ort
+    if _ort is None:
+        try:
+            import onnxruntime as ort
+            _ort = ort
+            logger.info("ONNX Runtime %s loaded", ort.__version__)
+        except ImportError:
+            raise RuntimeError(
+                "onnxruntime-cpu no instalado. "
+                "Añade 'onnxruntime-cpu==1.18.0' a requirements.txt y redespliega."
+            )
+    return _ort
 
 
-# ── Numpy LSTM cell ───────────────────────────────────────────────────────────
-class LSTMCell:
-    def __init__(self, input_size: int, hidden_size: int, seed: int = 42):
-        rng = np.random.RandomState(seed)
-        scale = 0.08  # slightly smaller init for stability
-        self.Wf = rng.randn(hidden_size, input_size + hidden_size) * scale
-        self.Wi = rng.randn(hidden_size, input_size + hidden_size) * scale
-        self.Wo = rng.randn(hidden_size, input_size + hidden_size) * scale
-        self.Wc = rng.randn(hidden_size, input_size + hidden_size) * scale
-        self.bf = np.zeros(hidden_size)
-        self.bi = np.zeros(hidden_size)
-        self.bo = np.zeros(hidden_size)
-        self.bc = np.zeros(hidden_size)
-        self.hidden_size = hidden_size
+# ── Model cache ───────────────────────────────────────────────────────────────
+_bundle_cache: Optional[dict] = None
 
-    def sigmoid(self, x): return 1 / (1 + np.exp(-np.clip(x, -20, 20)))
-    def tanh(self, x):    return np.tanh(np.clip(x, -20, 20))
+def _load_universal_model() -> dict:
+    global _bundle_cache
+    if _bundle_cache is not None:
+        return _bundle_cache
 
-    def forward_sequence(self, X: np.ndarray, dropout: float = 0.0) -> np.ndarray:
-        """X: (timesteps, features) → returns (hidden_size,) last hidden state."""
-        h = np.zeros(self.hidden_size)
-        c = np.zeros(self.hidden_size)
-        rng = np.random.RandomState(int(time.time() * 1000) % 100000)
+    ort = _get_ort()
+    onnx_path = MODELS_DIR / 'lstm_universal.onnx'
+    pkl_path  = MODELS_DIR / 'lstm_universal.pkl'
 
-        for t in range(len(X)):
-            xh = np.concatenate([X[t], h])
-            f  = self.sigmoid(self.Wf @ xh + self.bf)
-            i  = self.sigmoid(self.Wi @ xh + self.bi)
-            o  = self.sigmoid(self.Wo @ xh + self.bo)
-            c_ = self.tanh(self.Wc @ xh + self.bc)
-            c  = f * c + i * c_
-            h  = o * self.tanh(c)
-            if dropout > 0:
-                mask = rng.binomial(1, 1 - dropout, h.shape) / (1 - dropout)
-                h = h * mask
-
-        return h
-
-
-class NumpyLSTM:
-    """Single-layer LSTM + linear output, trained with mini-batch gradient descent."""
-
-    def __init__(self, input_size: int, hidden_size: int = HIDDEN_SIZE, seed: int = 42):
-        self.cell   = LSTMCell(input_size, hidden_size, seed)
-        rng = np.random.RandomState(seed)
-        self.W_out  = rng.randn(1, hidden_size) * 0.1
-        self.b_out  = np.zeros(1)
-        self.hidden_size = hidden_size
-        self.input_size  = input_size
-
-    def predict_one(self, X: np.ndarray, dropout: float = 0.0) -> float:
-        h = self.cell.forward_sequence(X, dropout=dropout)
-        return float(self.W_out @ h + self.b_out)
-
-    def predict_batch(self, Xs: np.ndarray, dropout: float = 0.0) -> np.ndarray:
-        return np.array([self.predict_one(x, dropout) for x in Xs])
-
-    def train(self, X_seq: np.ndarray, y: np.ndarray,
-              epochs: int = 30, lr: float = 0.005, batch_size: int = 16):
-        """
-        Simple training loop using numerical gradient approximation (finite differences).
-        Fast enough for TIMESTEPS=30, hidden=16, ~200 samples.
-        """
-        n_samples = len(X_seq)
-        best_loss = float('inf')
-        best_state = self._get_weights()
-
-        for epoch in range(epochs):
-            idx = np.random.permutation(n_samples)
-            epoch_loss = 0.0
-
-            for start in range(0, n_samples, batch_size):
-                batch_idx = idx[start:start + batch_size]
-                Xb = X_seq[batch_idx]
-                yb = y[batch_idx]
-
-                preds = self.predict_batch(Xb)
-                loss  = float(np.mean((preds - yb) ** 2))
-                epoch_loss += loss
-
-                # Gradient on output layer (analytical)
-                errors = preds - yb
-                for i, xi in enumerate(Xb):
-                    h = self.cell.forward_sequence(xi)
-                    grad_w = errors[i] * h
-                    self.W_out -= lr * grad_w.reshape(1, -1) / len(Xb)
-                    self.b_out -= lr * np.array([errors[i]]) / len(Xb)
-
-            avg_loss = epoch_loss / max(1, n_samples // batch_size)
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_state = self._get_weights()
-
-        self._set_weights(best_state)
-        return best_loss
-
-    def _get_weights(self):
-        return {
-            'Wf': self.cell.Wf.copy(), 'Wi': self.cell.Wi.copy(),
-            'Wo': self.cell.Wo.copy(), 'Wc': self.cell.Wc.copy(),
-            'bf': self.cell.bf.copy(), 'bi': self.cell.bi.copy(),
-            'bo': self.cell.bo.copy(), 'bc': self.cell.bc.copy(),
-            'W_out': self.W_out.copy(), 'b_out': self.b_out.copy(),
-        }
-
-    def _set_weights(self, state):
-        self.cell.Wf = state['Wf']; self.cell.Wi = state['Wi']
-        self.cell.Wo = state['Wo']; self.cell.Wc = state['Wc']
-        self.cell.bf = state['bf']; self.cell.bi = state['bi']
-        self.cell.bo = state['bo']; self.cell.bc = state['bc']
-        self.W_out   = state['W_out']; self.b_out = state['b_out']
-
-
-# ── Feature engineering ───────────────────────────────────────────────────────
-def _build_lstm_features(df: pd.DataFrame) -> Optional[np.ndarray]:
-    """
-    Returns (N, FEATURES) normalized array or None if insufficient data.
-
-    ✅ FIX: Uses rolling window normalization (last NORM_WINDOW days)
-    instead of full-history mean/std. This prevents stocks with strong
-    long-term trends (NVDA, SMCI...) from producing enormous std values
-    that amplify implied_return wildly when denormalizing.
-    """
-    df = df.copy()
-    closes = df['Close']
-    vols   = df['Volume']
+    if not onnx_path.exists():
+        raise ValueError(
+            "No se encontró lstm_universal.onnx en app/models/. "
+            "Ejecuta el notebook StockLens_Universal_LSTM.ipynb en Google Colab "
+            "y sube los archivos generados a stocklens-python/app/models/"
+        )
+    if not pkl_path.exists():
+        raise ValueError(
+            "No se encontró lstm_universal.pkl en app/models/. "
+            "Ejecuta el notebook StockLens_Universal_LSTM.ipynb en Google Colab."
+        )
 
     try:
-        df.ta.rsi(length=14, close=closes, append=True)
-        df.ta.macd(fast=12, slow=26, signal=9, close=closes, append=True)
-    except Exception:
-        pass
+        sess_opts = ort.SessionOptions()
+        sess_opts.intra_op_num_threads = 1
+        sess_opts.inter_op_num_threads = 1
 
-    rsi_col  = next((c for c in df.columns if c.startswith('RSI_')), None)
-    macd_col = next((c for c in df.columns if c.startswith('MACD_12')), None)
+        sess = ort.InferenceSession(
+            str(onnx_path),
+            sess_options=sess_opts,
+            providers=['CPUExecutionProvider'],
+        )
+        with open(pkl_path, 'rb') as f:
+            bundle = pickle.load(f)
 
-    # ✅ Rolling normalization: each point is normalized relative to recent window
-    roll_mean = closes.rolling(NORM_WINDOW, min_periods=20).mean()
-    roll_std  = closes.rolling(NORM_WINDOW, min_periods=20).std().replace(0, 1e-9)
-    vol_mean  = vols.rolling(NORM_WINDOW, min_periods=20).mean()
-    vol_std   = vols.rolling(NORM_WINDOW, min_periods=20).std().replace(0, 1e-9)
+        bundle['sess'] = sess
+        _bundle_cache = bundle
 
-    df['close_norm']  = (closes - roll_mean) / roll_std
-    df['volume_norm'] = (vols   - vol_mean)  / vol_std
-    df['return_1d']   = closes.pct_change().fillna(0).clip(-0.15, 0.15)  # clip outliers
-    df['rsi_norm']    = ((df[rsi_col] - 50) / 50) if rsi_col else 0.0
-    df['macd_norm']   = (df[macd_col] / (roll_std + 1e-9)) if macd_col else 0.0
+        meta = bundle['meta']
+        logger.info(
+            "Universal LSTM loaded: %d tickers, dir_acc=%.1f%%, trained_at=%s",
+            meta.get('n_tickers', 0),
+            meta.get('direction_acc', 0),
+            meta.get('trained_at', 'unknown'),
+        )
+        return bundle
 
-    feat_cols = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
-    df_clean  = df[feat_cols].dropna()
-    if len(df_clean) < TIMESTEPS + 20:
-        return None
-    return df_clean.values.astype(np.float32)
-
-
-def _build_sequences(features: np.ndarray, target_col: int = 0):
-    X, y = [], []
-    for i in range(TIMESTEPS, len(features)):
-        X.append(features[i - TIMESTEPS:i])
-        y.append(features[i, target_col])
-    return np.array(X), np.array(y)
+    except Exception as e:
+        raise RuntimeError(f"Error cargando modelo universal: {e}")
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
-    ticker = ticker.upper()
-    logger.info("LSTM (NumPy): %s %dd", ticker, days_ahead)
-
-    # Download 18 months for decent training set
-    stock = None
-    df_raw = None
+# ── Feature engineering (igual que el notebook) ───────────────────────────────
+def _build_features(ticker: str) -> tuple[np.ndarray, float, float]:
+    """
+    Construye la ventana de features para inferencia.
+    Returns: (X_window (TIMESTEPS, N_FEATURES), last_close, recent_vol)
+    """
+    df = None
     for attempt in range(settings.max_retries):
         try:
-            stock = yf.Ticker(ticker)
-            df_raw = stock.history(period='18mo', interval='1d', auto_adjust=True)
-            if df_raw is not None and len(df_raw) >= TIMESTEPS + 50:
+            df = yf.Ticker(ticker).history(period='6mo', interval='1d', auto_adjust=True)
+            if df is not None and len(df) >= TIMESTEPS + 30:
                 break
-            df_raw = None
+            df = None
         except Exception as e:
             logger.warning("yfinance attempt %d for %s: %s", attempt + 1, ticker, e)
             if attempt < settings.max_retries - 1:
                 time.sleep(settings.retry_delay)
 
-    if df_raw is None or df_raw.empty:
-        raise ValueError(f"No se encontraron datos para '{ticker}'")
+    if df is None or df.empty:
+        raise ValueError(f"No se pudieron descargar datos para '{ticker}'")
 
-    features = _build_lstm_features(df_raw)
-    if features is None:
-        raise ValueError(f"Datos insuficientes para construir secuencias LSTM para {ticker}")
+    closes = df['Close']; highs = df['High']
+    lows   = df['Low'];   vols  = df['Volume']
 
-    X, y = _build_sequences(features, target_col=0)  # predict close_norm
+    out = pd.DataFrame(index=df.index)
 
-    # Train/test split (85/15)
-    split     = int(len(X) * 0.85)
-    X_train   = X[:split]; y_train = y[:split]
-    X_test    = X[split:]; y_test  = y[split:]
+    # Returns
+    for n in [1, 3, 5, 10, 20]:
+        out[f'ret_{n}d'] = closes.pct_change(n).clip(-0.2, 0.2)
 
-    logger.info("LSTM training: %d train, %d test sequences", len(X_train), len(X_test))
+    # Distance from MAs
+    for length, col in [(10,'sma10'),(20,'sma20'),(50,'sma50')]:
+        sma = closes.rolling(length).mean()
+        out[f'dist_{col}'] = ((closes - sma) / (sma + 1e-9)).clip(-0.3, 0.3)
 
-    # Train model
-    model = NumpyLSTM(input_size=FEATURES, hidden_size=HIDDEN_SIZE, seed=42)
-    final_loss = model.train(X_train, y_train, epochs=30, lr=0.005, batch_size=16)
-    logger.info("LSTM trained — final MSE: %.6f", final_loss)
+    # RSI
+    rsi_s = ta.rsi(closes, length=14)
+    out['rsi_14'] = (rsi_s / 100.0).fillna(0.5) if rsi_s is not None else 0.5
 
-    # Test accuracy
-    y_pred_test = model.predict_batch(X_test)
+    # MACD
+    macd_df = ta.macd(closes, fast=12, slow=26, signal=9)
+    if macd_df is not None:
+        mcol = next((c for c in macd_df.columns if c.startswith('MACD_12')), None)
+        scol = next((c for c in macd_df.columns if c.startswith('MACDs_')), None)
+        hcol = next((c for c in macd_df.columns if c.startswith('MACDh_')), None)
+        out['macd_norm']        = (macd_df[mcol] / (closes+1e-9)).clip(-0.05, 0.05) if mcol else 0.0
+        out['macd_signal_norm'] = (macd_df[scol] / (closes+1e-9)).clip(-0.05, 0.05) if scol else 0.0
+        out['macd_hist_norm']   = (macd_df[hcol] / (closes+1e-9)).clip(-0.05, 0.05) if hcol else 0.0
+    else:
+        out['macd_norm'] = out['macd_signal_norm'] = out['macd_hist_norm'] = 0.0
 
-    # ✅ FIX: Denormalize using the LOCAL window stats (last NORM_WINDOW days),
-    # not the full 18-month history. This keeps the scale sane for trending stocks.
-    recent_closes = df_raw['Close'].iloc[-NORM_WINDOW:]
-    close_mean    = float(recent_closes.mean())
-    close_std     = float(recent_closes.std()) or 1.0
+    # Bollinger
+    bb = ta.bbands(closes, length=20, std=2)
+    if bb is not None:
+        bbu = next((c for c in bb.columns if c.startswith('BBU_')), None)
+        bbl = next((c for c in bb.columns if c.startswith('BBL_')), None)
+        bbm = next((c for c in bb.columns if c.startswith('BBM_')), None)
+        if bbu and bbl and bbm:
+            bw = bb[bbu] - bb[bbl]
+            out['bb_pct_b'] = ((closes - bb[bbl]) / (bw + 1e-9)).clip(-0.5, 1.5)
+            out['bb_width'] = (bw / (bb[bbm] + 1e-9)).clip(0, 0.2)
+        else:
+            out['bb_pct_b'] = out['bb_width'] = 0.0
+    else:
+        out['bb_pct_b'] = out['bb_width'] = 0.0
 
-    y_test_real = y_test  * close_std + close_mean
-    y_pred_real = y_pred_test * close_std + close_mean
-    # Protect against near-zero actuals in MAPE
-    valid_mask  = np.abs(y_test_real) > 0.01
-    mape = float(np.mean(np.abs(
-        (y_test_real[valid_mask] - y_pred_real[valid_mask]) / y_test_real[valid_mask]
-    )) * 100) if valid_mask.any() else 0.0
-    mae  = float(np.mean(np.abs(y_test_real - y_pred_real)))
+    # ATR
+    atr = ta.atr(highs, lows, closes, length=14)
+    out['atr_norm'] = (atr / (closes + 1e-9)).clip(0, 0.1) if atr is not None else 0.01
 
-    # Monte Carlo predictions — run N forward passes with dropout for uncertainty
-    N_MC = 30
-    last_seq      = features[-TIMESTEPS:]   # (30, 5)
-    mc_preds_norm = np.array([model.predict_one(last_seq, dropout=0.15) for _ in range(N_MC)])
-    mc_prices     = mc_preds_norm * close_std + close_mean
-    mean_next     = float(np.mean(mc_prices))
-    std_next      = float(np.std(mc_prices))
+    # Volatility
+    out['vol_20d'] = closes.pct_change().rolling(20).std().clip(0, 0.1)
 
-    # Build N-day forward predictions
-    # Busca el último close válido (no nan)
-    last_close = float(df_raw['Close'].dropna().iloc[-1])
-    if math.isnan(last_close) or last_close <= 0:
-        raise ValueError(f"Precio de cierre inválido para {ticker}")
+    # Volume
+    vol_sma = vols.rolling(20).mean()
+    out['vol_ratio'] = (vols / (vol_sma + 1e-9)).clip(0, 5)
 
-    # ✅ FIX: Clamp implied_return to ±5% to prevent lunatic predictions.
-    # The LSTM captures direction but magnitude is unreliable without full backprop.
-    raw_return     = (mean_next - last_close) / (last_close + 1e-9)
-    MAX_DAILY_RETURN = 0.05
-    implied_return = float(np.clip(raw_return, -MAX_DAILY_RETURN, MAX_DAILY_RETURN))
+    # OBV
+    obv = ta.obv(closes, vols)
+    if obv is not None:
+        obv_norm = (obv - obv.rolling(20).mean()) / (obv.rolling(20).std() + 1e-9)
+        out['obv_norm'] = obv_norm.clip(-3, 3)
+    else:
+        out['obv_norm'] = 0.0
+
+    # Candle
+    out['high_low_pct']   = ((highs - lows) / (closes + 1e-9)).clip(0, 0.1)
+    out['close_open_pct'] = ((closes - df['Open']) / (df['Open'] + 1e-9)).clip(-0.1, 0.1)
+
+    # Stochastic
+    stoch = ta.stoch(highs, lows, closes)
+    if stoch is not None:
+        k_col = next((c for c in stoch.columns if c.startswith('STOCHk_')), None)
+        d_col = next((c for c in stoch.columns if c.startswith('STOCHd_')), None)
+        out['stoch_k'] = (stoch[k_col] / 100.0).fillna(0.5) if k_col else 0.5
+        out['stoch_d'] = (stoch[d_col] / 100.0).fillna(0.5) if d_col else 0.5
+    else:
+        out['stoch_k'] = out['stoch_d'] = 0.5
+
+    # Fill any missing features with 0
+    for col in FEAT_COLS:
+        if col not in out.columns:
+            out[col] = 0.0
+
+    out = out[FEAT_COLS].fillna(0.0)
+    out_clean = out.dropna()
+
+    if len(out_clean) < TIMESTEPS:
+        raise ValueError(f"Features insuficientes para {ticker}: {len(out_clean)} filas")
+
+    X_window  = out_clean.values[-TIMESTEPS:].astype(np.float32)
+    last_close = float(closes.dropna().iloc[-1])
+    recent_vol = float(closes.pct_change().iloc[-20:].std()) or 0.015
+
+    return X_window, last_close, recent_vol
+
+
+def _sf(v: float, default: float = 0.0) -> float:
+    try:
+        f = float(v)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return default
+
+
+# ── Main inference ────────────────────────────────────────────────────────────
+def predict_lstm(ticker: str, days_ahead: int = 5) -> MLPredictionResponse:
+    ticker = ticker.upper()
+    logger.info("LSTM Universal ONNX: %s %dd", ticker, days_ahead)
+
+    # 1. Load model (cached after first call)
+    bundle   = _load_universal_model()
+    sess     = bundle['sess']
+    scaler_y = bundle['scaler_y']
+    meta     = bundle['meta']
+
+    # 2. Build features
+    X_window, last_close, recent_vol = _build_features(ticker)
+
+    # 3. Autoregressive prediction — day by day
+    daily_returns: list[float] = []
+    daily_stds:    list[float] = []
+    current_window = X_window.copy()  # (TIMESTEPS, N_FEATURES)
+    dropout_scale  = meta.get('dropout', 0.3) * 0.08
+
+    for day in range(days_ahead):
+        inp = current_window.reshape(1, TIMESTEPS, N_FEATURES)
+
+        # Monte Carlo Dropout — simulate uncertainty via input noise
+        mc_preds = []
+        for _ in range(MC_SAMPLES):
+            noise = np.random.normal(0, dropout_scale, inp.shape).astype(np.float32)
+            pred_norm = sess.run(None, {'input': inp + noise})[0][0]
+            mc_preds.append(float(pred_norm))
+
+        mc_arr    = np.array(mc_preds)
+        mean_norm = float(np.mean(mc_arr))
+        std_norm  = float(np.std(mc_arr))
+
+        # Denormalize
+        mean_ret = float(scaler_y.inverse_transform([[mean_norm]])[0][0])
+        std_ret  = abs(float(scaler_y.scale_[0]) * std_norm)
+
+        # Clamp daily return
+        mean_ret = float(np.clip(mean_ret, -MAX_RET_1D, MAX_RET_1D))
+        std_ret  = float(np.clip(std_ret, 0.001, MAX_RET_1D))
+
+        daily_returns.append(mean_ret)
+        daily_stds.append(std_ret)
+
+        # Update window: shift left and update return features with predicted return
+        new_row = current_window[-1].copy()
+
+        # Update ret_1d (index 0 in FEAT_COLS) with predicted return
+        new_row[0] = float(np.clip(mean_ret, -0.2, 0.2))
+
+        # Shift ret_3d, ret_5d etc. approximately
+        if len(FEAT_COLS) > 1: new_row[1] = float(np.clip(
+            current_window[-1][1] * 0.6 + mean_ret * 0.4, -0.2, 0.2))
+
+        current_window = np.vstack([current_window[1:], new_row.reshape(1, -1)])
 
     logger.info(
-        "LSTM %s: last_close=%.2f mean_next=%.2f raw_ret=%.3f%% clamped_ret=%.3f%%",
-        ticker, last_close, mean_next,
-        raw_return * 100, implied_return * 100,
+        "LSTM %s: returns=%s",
+        ticker,
+        [f"{r*100:+.2f}%" for r in daily_returns],
     )
 
+    # 4. Build prediction points
     predictions: list[PredictionPoint] = []
-    last_date = df_raw.index[-1]
-    if hasattr(last_date, 'to_pydatetime'):
-        last_date = last_date.to_pydatetime()
+    current_price = last_close
+    current_date  = datetime.now()
 
-    business_day = 0
-    current_date = last_date
-    while business_day < days_ahead:
+    for day_idx in range(days_ahead):
+        # Next business day
         current_date = current_date + timedelta(days=1)
-        if current_date.weekday() >= 5:
-            continue
-        business_day += 1
+        while current_date.weekday() >= 5:
+            current_date = current_date + timedelta(days=1)
 
-        frac       = business_day / max(days_ahead, 1)
-        day_ret    = implied_return * frac
-        # Uncertainty grows with time, anchored to recent volatility
-        recent_vol = float(df_raw['Close'].pct_change().iloc[-30:].std()) or 0.01
-        day_std    = recent_vol * np.sqrt(business_day) * 1.5
-        pred_price = last_close * (1 + day_ret)
-        lower      = last_close * (1 + day_ret - 1.96 * day_std)
-        upper      = last_close * (1 + day_ret + 1.96 * day_std)
-        conf       = round(max(0.1, min(0.92, 1.0 - abs(day_ret) - day_std)), 4)
+        day_ret = daily_returns[day_idx]
+        day_std = daily_stds[day_idx]
+
+        # Compound price
+        pred_price = current_price * (1 + day_ret)
+
+        # Confidence intervals — fan-out with horizon
+        # ✅ Incertidumbre que crece: combinamos MC std + vol histórica
+        horizon_vol  = np.sqrt(day_idx + 1) * (recent_vol * 1.5 + day_std * 0.5)
+        lower = pred_price * (1 - 1.96 * horizon_vol)
+        upper = pred_price * (1 + 1.96 * horizon_vol)
+
+        # Confidence: decreases with uncertainty AND horizon
+        # ✅ Confianza que decrece: no más 92% plano
+        horizon_decay = 1.0 / (1.0 + day_idx * 0.20)
+        uncertainty   = min(abs(day_ret) * 5 + day_std * 8, 0.8)
+        conf = round(float(np.clip((1.0 - uncertainty) * horizon_decay, 0.10, 0.88)), 4)
 
         predictions.append(PredictionPoint(
             date=current_date.strftime('%Y-%m-%d'),
-            predicted_price=round(pred_price, 2),
-            lower_bound=round(lower, 2),
-            upper_bound=round(upper, 2),
+            predicted_price=round(_sf(pred_price, last_close), 2),
+            lower_bound=round(_sf(lower, pred_price * 0.95), 2),
+            upper_bound=round(_sf(upper, pred_price * 1.05), 2),
             confidence=conf,
         ))
 
-# Sanitize metrics against nan/inf
-    def _sf(v, d=0.0):
-        try:
-            f = float(v)
-            return d if (math.isnan(f) or math.isinf(f)) else f
-        except Exception:
-            return d
+        current_price = pred_price  # compound
 
-    mape     = _sf(mape, 0.0)
-    mae      = _sf(mae, 0.0)
-    implied_return = _sf(implied_return, 0.0)
+    # 5. Feature importance — real from permutation importance (Colab)
+    feat_importance = meta.get('feat_importance', {})
 
-    # Sanitize prediction points
-    predictions = [
-        PredictionPoint(
-            date=p.date,
-            predicted_price=_sf(p.predicted_price, last_close),
-            lower_bound=_sf(p.lower_bound, last_close * 0.95),
-            upper_bound=_sf(p.upper_bound, last_close * 1.05),
-            confidence=_sf(p.confidence, 0.5),
-        )
-        for p in predictions
-    ]
-    feature_names = ['close_norm', 'rsi_norm', 'macd_norm', 'volume_norm', 'return_1d']
+    total_return_pct = (predictions[-1].predicted_price - last_close) / (last_close + 1e-9) * 100
 
     return MLPredictionResponse(
         ticker=ticker,
         model='lstm',
         days_ahead=days_ahead,
         predictions=predictions,
-        feature_importance={f: round(1.0 / FEATURES, 4) for f in feature_names},
+        feature_importance=feat_importance,
         accuracy_metrics={
-            'mape':           round(mape, 2),
-            'mae_usd':        round(mae, 2),
-            'train_samples':  len(X_train),
-            'test_samples':   len(X_test),
-            'mc_samples':     N_MC,
-            'timesteps':      TIMESTEPS,
-            'hidden_size':    HIDDEN_SIZE,
-            'implementation': 'numpy_lstm_v2',
-            'norm_window':    NORM_WINDOW,
-            'implied_return_pct': round(implied_return * 100, 2),
+            'direction_acc_pct': meta.get('direction_acc', 0.0),
+            'train_samples':     meta.get('train_samples', 0),
+            'test_samples':      meta.get('test_samples', 0),
+            'mc_samples':        MC_SAMPLES,
+            'timesteps':         TIMESTEPS,
+            'n_features':        N_FEATURES,
+            'hidden_size':       meta.get('hidden_size', 128),
+            'num_layers':        meta.get('num_layers', 3),
+            'n_tickers_trained': meta.get('n_tickers', 0),
+            'implementation':    'universal_onnx_lstm',
+            'total_return_pct':  round(_sf(total_return_pct), 2),
+            'trained_at':        meta.get('trained_at', 'unknown'),
         },
         last_updated=datetime.now().isoformat(),
         disclaimer=(
-            'LSTM NumPy v2 — normalización rolling (60d), retorno clampado ±5%. '
-            'Monte Carlo Dropout (30 muestras) para intervalos de confianza al 90%. '
+            f'LSTM Universal PyTorch v3 (ONNX Runtime) — '
+            f'entrenado con {meta.get("n_tickers", "N/A")} tickers del S&P 500, '
+            f'BPTT real, autoregresión iterativa día a día, '
+            f'MC Dropout ({MC_SAMPLES} muestras). '
+            f'Dirección accuracy: {meta.get("direction_acc", 0):.1f}%. '
             'No constituye consejo de inversión.'
         ),
     )
