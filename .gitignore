@@ -16,6 +16,5 @@ build/
 .mypy_cache/
 *.log
 models/saved/
-*.pkl
 *.joblib
 .DS_Store
